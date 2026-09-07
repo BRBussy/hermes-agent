@@ -73,6 +73,18 @@ class TestApiModeAccepted:
 
 
 class TestRunConversationCodexPath:
+    def test_cached_profile_context_is_forwarded_once(self, fake_session):
+        agent = _make_codex_agent()
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            agent.run_conversation("First turn", system_message="Profile marker: cobalt otter.")
+            session = agent._codex_session
+            instructions = session._developer_instructions
+            assert "Profile marker: cobalt otter." in instructions
+            assert instructions == agent._cached_system_prompt
+            agent.run_conversation("Second turn")
+        assert agent._codex_session is session
+        assert session._developer_instructions == instructions
+
     def test_run_conversation_returns_codex_shape(self, fake_session):
         agent = _make_codex_agent()
         # No background review fork during tests

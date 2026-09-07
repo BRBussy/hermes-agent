@@ -174,6 +174,20 @@ class TestLifecycle:
         assert params["cwd"] == "/tmp"
         assert "permissions" not in params  # see session.ensure_started() comment
 
+    @pytest.mark.parametrize("instructions", [None, "", "Profile memory: cobalt otter."])
+    def test_thread_instructions_are_sent_once(self, instructions):
+        client = FakeClient()
+        session = make_session(client, developer_instructions=instructions)
+        session.ensure_started()
+        session.ensure_started()
+        starts = [params for method, params in client.requests if method == "thread/start"]
+        assert len(starts) == 1
+        if instructions:
+            assert starts[0]["developerInstructions"] == instructions
+        else:
+            assert "developerInstructions" not in starts[0]
+        assert "baseInstructions" not in starts[0]
+
     def test_close_idempotent(self):
         client = FakeClient()
         s = make_session(client)

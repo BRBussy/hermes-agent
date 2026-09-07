@@ -197,6 +197,14 @@ model:
   openai_runtime: codex_app_server   # default is "auto" (= Hermes runtime)
 ```
 
+## Profile context
+
+Hermes sends its cached system prompt through `developerInstructions` when it creates a Codex thread.
+This includes the enabled profile memory and persona context assembled by Hermes.
+The instructions remain fixed for that thread, which preserves the conversation prefix across turns.
+Saved memory changes appear when Hermes builds the prompt for a new session.
+This context delivery does not expose the Hermes `memory` tool inside Codex.
+
 ## Self-improvement loop (memory + skill nudges)
 
 Hermes' background self-improvement fires on counter thresholds:
