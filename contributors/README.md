@@ -1,38 +1,31 @@
-# Contributor email → GitHub login mappings
+# Contributor email mappings
 
-This directory replaces appending entries to `AUTHOR_MAP` in
-`scripts/release.py`. The old dict caused constant merge conflicts when
-several salvage PRs landed at once — every PR edited the same lines of the
-same file. Here, **each mapping is its own file**, and file additions never
-conflict.
+Contributor mappings associate commit-author email addresses with GitHub logins for release attribution.
 
 ## Adding a mapping
 
-One file per commit-author email, under `emails/`:
+Use `scripts/add_contributor.py` with the exact commit-author email and GitHub login.
+The helper creates a file under `emails/` and refuses conflicting mappings.
 
-```bash
-python3 scripts/add_contributor.py <email> <github-login>
-# or by hand:
-echo "<github-login>" > contributors/emails/<email>
-```
+Each filename is an exact commit-author email.
+The first non-comment line contains its GitHub login.
+Lines beginning with `#` contain optional notes.
 
-- File **name** = the exact commit-author email (as shown by `git log --format='%ae'`).
-- File **content** = the GitHub login on the first non-comment line.
-  Lines starting with `#` are comments (use them for the PR reference).
+GitHub noreply addresses can resolve directly from their embedded login.
+The attribution check reports emails that need a mapping.
 
-Example — `contributors/emails/jane.doe@example.com`:
+## Case-sensitive email aliases
 
-```
-janedoe
-# PR #12345 salvage (gateway: fix session key routing)
-```
+Store case-colliding mappings in `email-aliases.json` as exact-email keys with GitHub login values.
+Keep the corresponding portable filename in `emails/`.
+The release generator and attribution checks include both sources.
+The contributor helper uses aliases before checking filenames and refuses new case-colliding filenames.
 
-## Rules
+For example, `agent@Agents-Mac-mini.local` maps to `skip-agent` in the alias file.
+The file `emails/agent@agents-Mac-mini.local` maps the lowercase email to `momomojo`.
+Both attributions remain distinct on case-insensitive filesystems.
 
-- Do NOT add new entries to `AUTHOR_MAP` in `scripts/release.py`. That dict
-  is frozen legacy data; the release tooling merges it with this directory
-  (directory entries win on duplicates).
-- GitHub noreply emails (`<id>+<login>@users.noreply.github.com` and
-  `<login>@users.noreply.github.com`) auto-resolve — no file needed.
-- The `Contributor Attribution Check` CI job fails a PR whose commits carry
-  an unmapped email; the failure message prints the exact command to run.
+## Existing mappings
+
+Keep `LEGACY_AUTHOR_MAP` in `scripts/release.py` frozen.
+Use contributor files or aliases for new mappings.

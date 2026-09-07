@@ -17,6 +17,7 @@ legacy AUTHOR_MAP), refuses with exit 1 so a typo can't silently reassign
 someone's commits.
 """
 
+import json
 import re
 import sys
 from pathlib import Path
@@ -30,6 +31,14 @@ _EMAIL_RE = re.compile(r"^[^/\\\s]+@[^/\\\s]+$")
 # users API July 2026). Accept any alphanumeric/hyphen login that doesn't
 # start or end with a hyphen, max 39 chars.
 _LOGIN_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
+
+
+def load_email_aliases() -> dict[str, str]:
+    """Read exact-email mappings whose filenames would collide on common filesystems."""
+    path = REPO_ROOT / "contributors" / "email-aliases.json"
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def read_mapping_file(path: Path) -> str | None:
@@ -67,7 +76,18 @@ def add_contributor(email: str, login: str, comment: str = "") -> int:
         return 2
 
     path = EMAILS_DIR / email
-    existing = read_mapping_file(path) if path.is_file() else None
+    existing = load_email_aliases().get(email)
+    if existing is None:
+        if EMAILS_DIR.is_dir():
+            for sibling in EMAILS_DIR.iterdir():
+                if sibling.name != email and sibling.name.casefold() == email.casefold():
+                    print(
+                        f"error: {email} collides with {sibling.name}. "
+                        "Add its exact mapping to contributors/email-aliases.json.",
+                        file=sys.stderr,
+                    )
+                    return 1
+        existing = read_mapping_file(path) if path.is_file() else None
     if existing is None:
         existing = _legacy_login(email)
     if existing is not None:

@@ -37,9 +37,6 @@ jobs:
             exit 0
           fi
 
-          # An email is mapped if it has a file in contributors/emails/
-          # (one file per email — conflict-free) or an entry in the frozen
-          # legacy AUTHOR_MAP in scripts/release.py.
           MISSING=""
           while IFS= read -r email; do
             # Skip teknium and bot emails
@@ -50,6 +47,10 @@ jobs:
 
             if echo "$email" | grep -qP '\+.*@users\.noreply\.github\.com'; then
               continue  # GitHub id+login noreply emails auto-resolve
+            fi
+
+            if python3 -c 'import sys; sys.path.insert(0, "scripts"); from add_contributor import load_email_aliases; sys.exit(0 if sys.argv[1] in load_email_aliases() else 1)' "$email"; then
+              continue
             fi
 
             if [ -f "contributors/emails/${email}" ]; then

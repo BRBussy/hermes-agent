@@ -1,10 +1,4 @@
-"""Tests for the conflict-free contributor mapping system.
-
-New contributor email → GitHub login mappings live as one file per email
-under contributors/emails/ (additions never merge-conflict). The legacy
-AUTHOR_MAP dict in scripts/release.py is frozen; release.py merges both at
-import time with the directory winning on duplicates.
-"""
+"""Tests for contributor attribution and portable mapping paths."""
 
 import subprocess
 import sys
@@ -116,3 +110,42 @@ def test_cli_entrypoint_end_to_end(tmp_path):
     assert proc.returncode == 0, proc.stderr
     out = (tmp_path / "contributors" / "emails" / "cli@example.com").read_text(encoding="utf-8")
     assert out.splitlines()[0] == "cliperson"
+
+
+def test_tracked_contributor_paths_are_case_unique():
+    paths = subprocess.check_output(
+        ["git", "ls-files", "contributors/"], cwd=REPO_ROOT, text=True
+    ).splitlines()
+    assert paths
+    assert len({path.casefold() for path in paths}) == len(paths)
+
+
+def test_case_alias_preserves_exact_attribution():
+    from audit_pr_attribution import is_mapped
+
+    assert release.AUTHOR_MAP["agent@agents-Mac-mini.local"] == "momomojo"
+    assert release.AUTHOR_MAP["agent@Agents-Mac-mini.local"] == "skip-agent"
+    assert is_mapped("agent@Agents-Mac-mini.local")
+
+
+def test_add_uses_alias_before_filesystem_lookup(tmp_path, monkeypatch):
+    import add_contributor as helper
+
+    root = tmp_path / "repo"
+    directory = root / "contributors" / "emails"
+    directory.mkdir(parents=True)
+    (directory / "person@example.com").write_text("lowercase\n")
+    (directory.parent / "email-aliases.json").write_text(
+        '{"Person@example.com": "uppercase"}\n'
+    )
+    monkeypatch.setattr(helper, "REPO_ROOT", root)
+    monkeypatch.setattr(helper, "EMAILS_DIR", directory)
+    assert helper.add_contributor("Person@example.com", "uppercase") == 0
+    assert helper.add_contributor("Person@example.com", "incorrect") == 1
+    assert len(list(directory.iterdir())) == 1
+
+
+def test_add_refuses_case_colliding_filename(emails_dir):
+    assert add_contributor("person@example.com", "person") == 0
+    assert add_contributor("Person@example.com", "person") == 1
+    assert len(list(emails_dir.iterdir())) == 1

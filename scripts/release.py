@@ -30,6 +30,8 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
+from add_contributor import load_email_aliases
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VERSION_FILE = REPO_ROOT / "hermes_cli" / "__init__.py"
 PYPROJECT_FILE = REPO_ROOT / "pyproject.toml"
@@ -2109,7 +2111,7 @@ def _load_contributor_dir(directory: "Path | None" = None) -> dict:
 
 
 # Effective map: frozen legacy dict + directory entries (directory wins).
-AUTHOR_MAP = {**LEGACY_AUTHOR_MAP, **_load_contributor_dir()}
+AUTHOR_MAP = {**LEGACY_AUTHOR_MAP, **_load_contributor_dir(), **load_email_aliases()}
 
 
 def git(*args, cwd=None):

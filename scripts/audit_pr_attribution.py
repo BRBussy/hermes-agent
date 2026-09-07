@@ -12,8 +12,8 @@ Logic (kept in sync with contributor-check.yml):
   - scans ``git log $(git merge-base origin/main HEAD)..HEAD --format=%ae``
   - skips teknium/bot emails and ``<id>+<login>@users.noreply.github.com``
     (CI auto-resolves those)
-  - everything else must have ``contributors/emails/<email>`` or a legacy
-    AUTHOR_MAP entry in scripts/release.py
+  - other emails require a contributor file, an exact-email alias, or a
+    LEGACY_AUTHOR_MAP entry in scripts/release.py
 
 ``--fix`` resolution order for an unmapped email:
   1. bare ``<login>@users.noreply.github.com`` → ``<login>``, verified via
@@ -30,6 +30,8 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+
+from add_contributor import load_email_aliases
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -62,6 +64,8 @@ def new_emails() -> list[str]:
 
 
 def is_mapped(email: str) -> bool:
+    if email in load_email_aliases():
+        return True
     if any(s in email for s in SKIP_SUBSTRINGS):
         return True
     if ID_NOREPLY_RE.search(email):
