@@ -64,12 +64,18 @@ Hermes 将自身注册为 MCP server，以便 Codex 能够回调获取 Codex 自
 
 当模型需要其中某个工具时，Codex 通过 stdio MCP 生成 `hermes_tools_mcp_server` 子进程，调用通过 `model_tools.handle_function_call()` 分发（与 Hermes 默认运行时的代码路径相同），结果像其他 MCP 响应一样返回给 Codex。
 
+### 内置记忆
+
+MCP `memory` 工具支持在所选配置文件中添加、替换和删除内置记忆条目。
+它使用 Hermes 的容量限制和写入审批机制。暂存的写入需要审批后才会保存。
+MCP 注册通过 `env_vars` 在启动时继承 `HERMES_HOME`。现有安装需要更新 MCP 注册。
+这些操作不包含外部记忆提供商的同步。
+
 ### 此运行时上不可用的工具
 
-以下四个 Hermes 工具需要运行中的 AIAgent 上下文（循环中间状态）才能分发，无状态的 MCP 回调无法驱动它们。需要这些工具时，请切换回默认运行时（`/codex-runtime auto`）：
+以下三个 Hermes 工具需要运行中的 AIAgent 上下文（循环中间状态）才能分发，无状态的 MCP 回调无法驱动它们。需要这些工具时，请切换回默认运行时（`/codex-runtime auto`）：
 
 - **`delegate_task`** — 生成子 agent
-- **`memory`** — Hermes 的持久记忆存储
 - **`session_search`** — 跨会话搜索
 - **`todo`** — Hermes 的待办存储（Codex 的 `update_plan` 是运行时内的等效工具）
 
@@ -99,14 +105,14 @@ Kanban 工具通过分发器设置的 `HERMES_KANBAN_TASK` 环境变量进行访
 
 ### Cron 任务
 
-**尚未经过专项测试。** Cron 任务通过 `cronjob` → `AIAgent.run_conversation` 运行，与 CLI 的代码路径相同。如果 cron 任务的配置中有 `openai_runtime: codex_app_server`，它将在 Codex 上运行。相同的工具可用性规则适用——Codex 内置工具 + 插件 + MCP 回调可用，agent 循环工具（delegate_task、memory、session_search、todo）不可用。如果你的 cron 任务依赖这些工具，请将 cron 限定在使用默认运行时的配置文件中。
+**尚未经过专项测试。** Cron 任务通过 `cronjob` → `AIAgent.run_conversation` 运行，与 CLI 的代码路径相同。如果 cron 任务的配置中有 `openai_runtime: codex_app_server`，它将在 Codex 上运行。相同的工具可用性规则适用——Codex 内置工具 + 插件 + MCP 回调可用，agent 循环工具（delegate_task、session_search、todo）不可用。如果你的 cron 任务依赖这些工具，请将 cron 限定在使用默认运行时的配置文件中。
 
 ## 权衡对比
 
 |  | Hermes 默认运行时 | Codex app-server（可选启用） |
 |---|---|---|
 | `delegate_task` 子 agent | 是 | 不可用——需要 agent 循环上下文 |
-| `memory`、`session_search`、`todo` | 是 | 不可用——需要 agent 循环上下文 |
+| `session_search`、`todo` | 是 | 不可用——需要 agent 循环上下文 |
 | `web_search`、`web_extract` | 是 | 是（通过 MCP 回调） |
 | 浏览器自动化（Camofox/Browserbase） | 是 | 是（通过 MCP 回调） |
 | `vision_analyze`、`image_generate` | 是 | 是（通过 MCP 回调） |
@@ -350,7 +356,8 @@ Codex 的内置工具集涵盖 shell/文件操作/patch，但没有网络搜索�
 [mcp_servers.hermes-tools]
 command = "/path/to/python"
 args = ["-m", "agent.transports.hermes_tools_mcp_server"]
-env = { HERMES_HOME = "/your/.hermes", PYTHONPATH = "...", HERMES_QUIET = "1" }
+env_vars = ["HERMES_HOME"]
+env = { PYTHONPATH = "...", HERMES_QUIET = "1" }
 startup_timeout_sec = 30.0
 tool_timeout_sec = 600.0
 ```
@@ -359,7 +366,7 @@ tool_timeout_sec = 600.0
 
 **通过回调可用的工具：** `web_search`、`web_extract`、`browser_navigate`、`browser_click`、`browser_type`、`browser_press`、`browser_snapshot`、`browser_scroll`、`browser_back`、`browser_get_images`、`browser_console`、`browser_vision`、`vision_analyze`、`image_generate`、`skill_view`、`skills_list`、`text_to_speech`。
 
-**不可用的工具：** `delegate_task`、`memory`、`session_search`、`todo`。这些工具需要运行中的 AIAgent 上下文（循环中间状态）才能分发，无状态的 MCP 回调无法驱动它们。需要这些工具时，请使用默认 Hermes 运行时（`/codex-runtime auto`）。
+**不可用的工具：** `delegate_task`、`session_search`、`todo`。这些工具需要运行中的 AIAgent 上下文（循环中间状态）才能分发，无状态的 MCP 回调无法驱动它们。需要这些工具时，请使用默认 Hermes 运行时（`/codex-runtime auto`）。
 
 ## 禁用
 
@@ -387,7 +394,7 @@ tool_timeout_sec = 600.0
 已知限制：
 
 - **Hermes 认证和 Codex 认证是独立的会话。** 为获得最佳体验，你需要同时运行 `codex login` 和 `hermes auth login codex`（运行时使用 Codex 的会话进行 LLM 调用）。这是 Hermes `_import_codex_cli_tokens` 中的有意设计——Hermes 不会与 Codex CLI 共享 OAuth 状态，以避免在 token 刷新时相互覆盖。
-- **`delegate_task`、`memory`、`session_search`、`todo` 在此运行时上不可用。** 它们需要运行中的 AIAgent 上下文，无状态的 MCP 回调无法提供。需要这些工具时，请使用 `/codex-runtime auto`。
+- **`delegate_task`、`session_search`、`todo` 在此运行时上不可用。** 它们需要运行中的 AIAgent 上下文，无状态的 MCP 回调无法提供。需要这些工具时，请使用 `/codex-runtime auto`。
 - **当 Codex 未跟踪变更集时，审批提示中没有内联 patch 预览。** Codex 的 `fileChange` 审批参数并不总是携带变更集。Hermes 会尽可能从对应的 `item/started` 通知中缓存数据，但如果审批在事件项流式传输完成之前到达，提示会回退到 Codex 提供的 `reason`。
 - **亚秒级取消无法保证。** 流式传输中途的中断（Codex 响应时按 Ctrl+C）通过 `turn/interrupt` 发送，但如果 Codex 已经刷新了最终消息，你仍会收到该响应。
 

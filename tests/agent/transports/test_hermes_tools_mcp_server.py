@@ -1,14 +1,9 @@
-"""Tests for the hermes-tools-as-MCP server module surface.
-
-We don't run a live MCP session in unit tests — that requires the codex
-subprocess + client + an event loop. These tests pin the static
-contract: the module imports, the EXPOSED_TOOLS list is sane, and the
-build helper assembles a server when the SDK is present.
-"""
+"""Tests for Hermes MCP schemas, dispatch and profile memory operations."""
 
 from __future__ import annotations
 
 import inspect
+import pytest
 from typing import get_args
 
 from agent.transports.hermes_tools_mcp_server import (
@@ -146,3 +141,79 @@ class TestMain:
         monkeypatch.setattr(m, "_build_server", lambda: CrashingServer())
         rc = m.main([])
         assert rc == 1
+
+
+@pytest.mark.asyncio
+class TestMemoryMCP:
+    async def test_memory_round_trip_preserves_unrelated_facts(self, tmp_path, monkeypatch):
+        import json
+        from agent.transports.hermes_tools_mcp_server import _build_server
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        memories = tmp_path / "memories"
+        memories.mkdir()
+        path = memories / "USER.md"
+        path.write_text("Unrelated preference: tea.\n")
+        server = _build_server()
+        steps = [
+            ({"action": "add", "target": "user", "content": "Notebook label: maple."}, "maple"),
+            ({"action": "replace", "target": "user", "old_text": "Notebook label:", "content": "Notebook label: birch."}, "birch"),
+            ({"action": "remove", "target": "user", "old_text": "Notebook label:"}, None),
+        ]
+        for args, expected in steps:
+            result = await server.call_tool("memory", args)
+            data = json.loads(result.content[0].text)
+            assert data["success"] is True, data
+            assert not data.get("staged")
+            content = path.read_text()
+            assert "Unrelated preference: tea." in content
+            if expected:
+                assert expected in content
+            else:
+                assert "Notebook label:" not in content
+
+    async def test_memory_rechecks_disabled_target(self, tmp_path, monkeypatch):
+        import json
+        from agent.transports.hermes_tools_mcp_server import _build_server
+        from hermes_cli.config import load_config, save_config
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        server = _build_server()
+        config = load_config()
+        config.setdefault("memory", {})["user_profile_enabled"] = False
+        save_config(config)
+        result = await server.call_tool("memory", {"action": "add", "target": "user", "content": "Must not persist."})
+        data = json.loads(result.content[0].text)
+        assert data["success"] is False
+        assert not (tmp_path / "memories" / "USER.md").exists()
+
+    async def test_memory_honours_character_limit(self, tmp_path, monkeypatch):
+        import json
+        from agent.transports.hermes_tools_mcp_server import _build_server
+        from hermes_cli.config import load_config, save_config
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        config = load_config()
+        config.setdefault("memory", {})["user_char_limit"] = 12
+        save_config(config)
+        server = _build_server()
+        result = await server.call_tool("memory", {"action": "add", "target": "user", "content": "This entry exceeds the configured limit."})
+        data = json.loads(result.content[0].text)
+        assert data["success"] is False
+        assert not (tmp_path / "memories" / "USER.md").exists()
+
+    async def test_memory_stages_writes_when_approval_is_required(self, tmp_path, monkeypatch):
+        import json
+        from agent.transports.hermes_tools_mcp_server import _build_server
+        from hermes_cli.config import load_config, save_config
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        config = load_config()
+        config.setdefault("memory", {})["write_approval"] = True
+        save_config(config)
+        server = _build_server()
+        result = await server.call_tool("memory", {"action": "add", "target": "user", "content": "Pending preference."})
+        data = json.loads(result.content[0].text)
+        assert data["staged"] is True
+        assert data["pending_id"]
+        assert not (tmp_path / "memories" / "USER.md").exists()

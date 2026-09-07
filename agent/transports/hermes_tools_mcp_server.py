@@ -1,45 +1,8 @@
-"""Hermes-tools-as-MCP server for the codex_app_server runtime.
+"""Hermes tools exposed through stdio MCP for Codex app-server sessions.
 
-When the user runs `openai/*` turns through the codex app-server, codex
-owns the loop and builds its own tool list. By default, that means
-Hermes' richer tool surface — web search, browser automation,
-delegate_task subagents, vision analysis, persistent memory, skills,
-cross-session search, image generation, TTS — is unreachable.
-
-This module exposes a curated subset of those Hermes tools to the
-spawned codex subprocess via stdio MCP. Codex registers it as a normal
-MCP server (per `~/.codex/config.toml [mcp_servers.hermes-tools]`) and
-the user gets full Hermes capability inside a Codex turn.
-
-Scope (what we expose):
-  - web_search, web_extract              — Firecrawl, no codex equivalent
-  - browser_navigate / _click / _type /  — Camofox/Browserbase automation
-    _snapshot / _scroll / _back / _press /
-    _get_images / _console / _vision
-  - vision_analyze                       — image inspection by vision model
-  - image_generate                       — image generation
-  - skill_view, skills_list              — Hermes' skill library
-  - text_to_speech                       — TTS
-  - kanban_* (complete/block/comment/    — kanban worker + orchestrator
-    heartbeat/show/list/create/            handoff (stateless: read env var,
-    unblock/link)                          write ~/.hermes/kanban.db)
-
-What we DO NOT expose:
-  - terminal / shell                     — codex's own shell tool
-  - read_file / write_file / patch       — codex's apply_patch + shell
-  - search_files / process               — codex's shell
-  - clarify                              — codex's own UX
-  - delegate_task / memory /             — `_AGENT_LOOP_TOOLS` in Hermes
-    session_search / todo                  (model_tools.py). They require
-                                           the running AIAgent context to
-                                           dispatch (mid-loop state), so a
-                                           stateless MCP callback can't
-                                           drive them. See the inline
-                                           comment on EXPOSED_TOOLS below.
-
-Run with: python -m agent.transports.hermes_tools_mcp_server
-Spawned by: CodexAppServerSession.ensure_started() when the runtime is
-            active and config opts in.
+Tool schemas come from the Hermes registry. Built-in memory operations use a
+fresh profile-scoped store and its configured write approval gate. Other
+exposed tools use the standard Hermes function dispatcher.
 """
 
 from __future__ import annotations
@@ -97,18 +60,6 @@ def _signature_from_schema(schema: dict | None) -> tuple[inspect.Signature, dict
     return inspect.Signature(params, return_annotation=str), annots
 
 
-# Tools we expose. Each name MUST match a registered Hermes tool that
-# `model_tools.handle_function_call()` can dispatch.
-#
-# What we deliberately DO NOT expose:
-#   - terminal / shell / read_file / write_file / patch / search_files /
-#     process — codex's built-ins cover these and approval routes through
-#     codex's own UI.
-#   - delegate_task / memory / session_search / todo — these are
-#     `_AGENT_LOOP_TOOLS` in Hermes (model_tools.py:493). They require
-#     the running AIAgent context to dispatch (mid-loop state), so a
-#     stateless MCP callback can't drive them. Hermes' default runtime
-#     keeps these working; the codex_app_server runtime cannot.
 EXPOSED_TOOLS: tuple[str, ...] = (
     "web_search",
     "web_extract",
@@ -127,6 +78,7 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "skill_view",
     "skills_list",
     "text_to_speech",
+    "memory",
     # Kanban worker handoff tools — gated on HERMES_KANBAN_TASK env var
     # (set by the kanban dispatcher when spawning a worker). Without these
     # in the callback, a worker spawned with openai_runtime=codex_app_server
@@ -176,8 +128,8 @@ def _build_server() -> Any:
             "Hermes Agent's tool surface, exposed for use inside a Codex "
             "session. Use these for capabilities Codex's built-in toolset "
             "doesn't cover: web search/extract, browser automation, "
-            "subagent delegation, vision, image generation, persistent "
-            "memory, skills, and cross-session search."
+            "vision, image generation, built-in profile memory, skills, "
+            "and Kanban task management."
         ),
     )
 
@@ -216,6 +168,10 @@ def _build_server() -> Any:
                     # Filter out None values before dispatch so unset optionals
                     # aren't forwarded to the handler.
                     args = {k: v for k, v in kwargs.items() if v is not None}
+                    if tool_name == "memory":
+                        from tools.memory_tool import load_on_disk_store, memory_tool
+
+                        return memory_tool(store=load_on_disk_store(), **args)
                     return handle_function_call(tool_name, args or {})
                 except Exception as exc:
                     logger.exception("tool %s raised", tool_name)

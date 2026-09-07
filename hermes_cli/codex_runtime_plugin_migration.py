@@ -528,32 +528,6 @@ def _query_codex_plugins(
     return out, None
 
 
-def _looks_like_test_tempdir(path: str) -> bool:
-    """Heuristic: does ``path`` look like a pytest/transient tempdir?
-
-    pytest tempdirs live under ``pytest-of-<user>/pytest-<n>/`` (created via
-    ``tmp_path`` / ``tmp_path_factory``) and are reaped between sessions.
-    macOS routes ``/tmp`` through ``/private/var/folders/<…>/T`` which is
-    what pytest's tempdir factory uses by default. If a HERMES_HOME pointing
-    at one of those paths is burned into ``~/.codex/config.toml``, every
-    codex-routed hermes-tools call fails silently once the directory is GC'd.
-
-    We err on the side of refusing — losing a (very unlikely) real
-    ``~/.hermes`` symlink that happens to live under ``/private/var/folders``
-    is much less harmful than silently bricking codex's tool surface.
-    """
-    if not path:
-        return False
-    needles = (
-        "pytest-of-",
-        "/pytest-",
-        "/tmp/pytest",
-        "/private/var/folders/",  # macOS tempdir root
-    )
-    normalized = path.lower()
-    return any(needle in normalized for needle in needles)
-
-
 def _build_hermes_tools_mcp_entry() -> dict:
     """Build the codex stdio-transport entry that launches Hermes' own
     tool surface as an MCP server. Codex's subprocess will call back into
@@ -566,24 +540,6 @@ def _build_hermes_tools_mcp_entry() -> dict:
     import sys
 
     env: dict[str, str] = {}
-    # HERMES_HOME passes through IF SET so the MCP subprocess sees the same
-    # config / auth / sessions DB as the parent CLI. Read from os.environ
-    # (not get_hermes_home()) on purpose: when the env var is unset we want
-    # codex's subprocess to inherit whatever HERMES_HOME its launcher sets
-    # at runtime (systemd unit, gateway, kanban dispatcher, custom shell),
-    # rather than burning the migrate-time resolved default into config.toml
-    # — that would override the launcher's HERMES_HOME and pin the subprocess
-    # to the wrong profile.
-    #
-    # The pytest-tempdir guard below catches the issue #26250 Bug C scenario:
-    # a sibling test's monkeypatch.setenv("HERMES_HOME", tmp_path) would
-    # otherwise leak a transient pytest tempdir into the user's real
-    # ~/.codex/config.toml and silently brick codex once the tempdir is GC'd.
-    hermes_home = os.environ.get("HERMES_HOME") or ""
-    if hermes_home and _looks_like_test_tempdir(hermes_home):
-        hermes_home = ""
-    if hermes_home:
-        env["HERMES_HOME"] = hermes_home
     # PYTHONPATH passes through so a worktree-launched hermes finds the
     # branch's modules instead of the installed package.
     pythonpath = os.environ.get("PYTHONPATH")
@@ -596,6 +552,7 @@ def _build_hermes_tools_mcp_entry() -> dict:
     out: dict[str, Any] = {
         "command": sys.executable,
         "args": ["-m", "agent.transports.hermes_tools_mcp_server"],
+        "env_vars": ["HERMES_HOME"],
     }
     if env:
         out["env"] = env

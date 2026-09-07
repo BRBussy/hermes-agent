@@ -245,12 +245,12 @@ def apply(
                 msg_lines.append(
                     "Hermes tool callback registered: codex can now use "
                     "web_search, web_extract, browser_*, vision_analyze, "
-                    "image_generate, skill_view, skills_list, text_to_speech, "
+                    "image_generate, skill_view, skills_list, text_to_speech, memory, "
                     "kanban_* (worker + orchestrator) via MCP."
                 )
                 msg_lines.append(
-                    "  (delegate_task, memory, session_search, todo run "
-                    "only on the default Hermes runtime — they need the "
+                    "  (delegate_task, session_search, todo run "
+                    "only on the default Hermes runtime. They need the "
                     "agent loop context.)"
                 )
             msg_lines.append(f"  (config: {mig_report.target_path})")
