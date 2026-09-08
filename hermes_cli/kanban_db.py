@@ -7700,7 +7700,14 @@ def _is_linked_worktree_checkout(path: Path) -> bool:
     common_dir = _git_common_dir(path)
     if git_dir is None or common_dir is None:
         return False
-    return git_dir != common_dir
+    if git_dir == common_dir:
+        return False
+    result = subprocess.run(
+        ["git", "-C", str(path), "worktree", "list", "--porcelain", "-z"],
+        capture_output=True, text=True, timeout=30, check=False,
+    )
+    registered = (result.stdout or "").split("\0")
+    return result.returncode == 0 and f"worktree {path.resolve()}" in registered
 
 
 def _nearest_existing_path(path: Path) -> Path:
@@ -7721,54 +7728,78 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
+def _checked_worktree_path(path: Path) -> Path:
+    path = path.expanduser()
+    if not path.is_absolute() or ".." in path.parts or any(ord(c) < 32 for c in str(path)):
+        raise ValueError(f"Worktree path must be absolute and contain safe components: {path!s}")
+    if any(part.is_symlink() for part in (path, *path.parents)):
+        raise ValueError(f"Worktree path must not traverse symbolic links: {path}")
+    return path.resolve(strict=False)
+
+
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
-    """Materialize ``target`` as a linked git worktree under ``repo_root``."""
-    target = target.expanduser()
+    """Serialise creation and validate checkout ownership before reusing a target."""
+    from hermes_cli import auth
+
+    repo_root = _checked_worktree_path(repo_root)
+    target = _checked_worktree_path(target)
+    _checked_worktree_path(repo_root / ".git")
     repo_common = _git_common_dir(repo_root)
-    if target.exists() and repo_common is not None:
-        target_common = _git_common_dir(target)
-        if target_common == repo_common:
-            return
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if _git_branch_exists(repo_root, branch_name):
-        cmd = ["git", "-C", str(repo_root), "worktree", "add", str(target), branch_name]
-    else:
-        cmd = [
-            "git", "-C", str(repo_root), "worktree", "add", "-b", branch_name,
-            str(target), "HEAD",
-        ]
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True, encoding='utf-8', errors='replace',
-        timeout=60,
-        check=False,
+    if (
+        repo_common is None
+        or _git_toplevel(repo_root) != repo_root
+        or (_git_dir(repo_root) != repo_common and not _is_linked_worktree_checkout(repo_root))
+    ):
+        raise ValueError(f"Worktree anchor must be a Git checkout root: {repo_root}")
+    checked_branch = subprocess.run(
+        ["git", "check-ref-format", f"refs/heads/{branch_name}"],
+        capture_output=True, timeout=30, check=False,
     )
-    if result.returncode != 0:
-        stderr = (result.stderr or result.stdout or "").strip()
-        raise RuntimeError(
-            f"git worktree add failed for {target} on branch {branch_name}: {stderr}"
+    if not branch_name or branch_name.startswith("-") or checked_branch.returncode != 0:
+        raise ValueError(f"Invalid worktree branch: {branch_name!r}")
+    if auth.fcntl is None and auth.msvcrt is None:
+        raise RuntimeError("Cross-process worktree locking is unavailable")
+    lock_path = _checked_worktree_path(repo_common / "hermes-worktrees.lock")
+    if lock_path.exists() and not lock_path.is_file():
+        raise ValueError(f"Worktree lock must be a regular file: {lock_path}")
+    # Every board using this repository must acquire the same lock.
+    with auth._file_lock(lock_path, threading.local(), 120, f"Timed out locking worktrees for {repo_root}"):
+        _checked_worktree_path(target)
+        if target.exists():
+            _checked_worktree_path(target / ".git")
+            if (
+                _git_toplevel(target) != target
+                or not _is_linked_worktree_checkout(target)
+                or _git_common_dir(target) != repo_common
+                or _git_current_branch(target) != branch_name
+            ):
+                raise ValueError(f"Existing path is not the requested repository worktree and branch: {target}")
+            return
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if _git_branch_exists(repo_root, branch_name):
+            cmd = ["git", "-C", str(repo_root), "worktree", "add", str(target), branch_name]
+        else:
+            cmd = [
+                "git", "-C", str(repo_root), "worktree", "add", "-b", branch_name,
+                str(target), "HEAD",
+            ]
+        result = subprocess.run(
+            cmd, capture_output=True,
+            text=True, encoding='utf-8', errors='replace', timeout=60, check=False,
         )
+        if result.returncode != 0:
+            stderr = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(f"git worktree add failed for {target} on branch {branch_name}: {stderr}")
 
 
 def _resolve_worktree_workspace(
     task: Task, *, board: Optional[str] = None
 ) -> tuple[Path, str]:
-    """Resolve + materialize a linked git worktree for ``task``.
-
-    When ``task.workspace_path`` is unset, the anchor is the board's
-    ``default_workdir`` (a persistent project checkout). This keeps every
-    worktree task under a meaningful, board-owned repo — ``<repo>/.worktrees/
-    <task-id>`` — instead of silently landing under the dispatcher's current
-    working directory (which is whatever directory the gateway happened to be
-    launched from, e.g. the Hermes checkout). If no anchor is configured
-    anywhere, we fail loudly rather than guess.
-    """
-    branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
+    """Use the explicit path or board checkout as the task's worktree anchor."""
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", task.id):
+        raise ValueError(f"Invalid worktree task identifier: {task.id!r}")
+    branch_name = task.branch_name or f"wt/{task.id}"
     if not task.workspace_path:
-        # Anchor on the board's configured default_workdir, not Path.cwd().
-        # The dispatcher's CWD is incidental (gateway launch dir) and using it
-        # scatters worktrees under whatever repo the gateway started in.
         board_slug = board if board else get_current_board()
         board_default = (read_board_metadata(board_slug).get("default_workdir") or "").strip()
         if not board_default:
@@ -7778,12 +7809,7 @@ def _resolve_worktree_workspace(
                 "default workdir (a git repo) or create the task with "
                 "--workspace worktree:<absolute-repo-path>."
             )
-        anchor = Path(board_default).expanduser()
-        if not anchor.is_absolute():
-            raise ValueError(
-                f"board {board_slug!r} default_workdir {board_default!r} is not "
-                "absolute; use an absolute path to a git repo"
-            )
+        anchor = _checked_worktree_path(Path(board_default))
         repo_root = _git_toplevel(anchor)
         if repo_root is None:
             raise ValueError(
@@ -7794,35 +7820,24 @@ def _resolve_worktree_workspace(
         _ensure_git_worktree(repo_root, target, branch_name)
         return target, branch_name
 
-    requested = Path(task.workspace_path).expanduser()
-    if not requested.is_absolute():
-        raise ValueError(
-            f"task {task.id} has non-absolute worktree path "
-            f"{task.workspace_path!r}; use an absolute path"
-        )
+    requested = _checked_worktree_path(Path(task.workspace_path))
     requested_resolved = requested.resolve(strict=False)
 
     if requested.exists() and _is_linked_worktree_checkout(requested):
         actual_branch = _git_current_branch(requested)
+        if _git_toplevel(requested) != requested_resolved:
+            raise ValueError(f"Worktree path is not a checkout root: {requested}")
         if actual_branch == branch_name:
+            _ensure_git_worktree(requested, requested, branch_name)
             return requested_resolved, actual_branch
-        # The requested path is an existing checkout of a DIFFERENT
-        # task's branch. Decompose children inherit the root's
-        # workspace_path verbatim, so siblings all point here; reusing
-        # the checkout as-is would run this task on the other task's
-        # branch — silent cross-task provenance corruption, and unsafe
-        # when siblings run concurrently. Fall back to a fresh worktree
-        # of our own under the same repo.
+        # Decomposed children can inherit another task's path.
         fallback_root = _repo_root_for_worktree_target(requested.parent)
         if fallback_root is not None:
             fallback = fallback_root / ".worktrees" / task.id
             if fallback.resolve(strict=False) != requested_resolved:
                 _ensure_git_worktree(fallback_root, fallback, branch_name)
                 return fallback.resolve(strict=False), branch_name
-        # No repo to anchor a fallback on (or the occupied path IS this
-        # task's own canonical worktree): keep the legacy reuse rather
-        # than failing dispatch.
-        return requested_resolved, actual_branch or branch_name
+        raise ValueError(f"Existing worktree has a conflicting branch: {requested}")
 
     repo_root = _git_toplevel(requested)
     if repo_root is not None and requested_resolved == repo_root:
