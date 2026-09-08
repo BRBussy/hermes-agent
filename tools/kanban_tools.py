@@ -493,6 +493,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "status": task.status,
         "priority": task.priority,
         "tenant": task.tenant,
+        "review_required": task.review_required,
         "workspace_kind": task.workspace_kind,
         "workspace_path": task.workspace_path,
         "project_id": task.project_id,
@@ -540,6 +541,7 @@ def _handle_show(args: dict, **kw) -> str:
                     "id": t.id, "title": t.title, "body": t.body,
                     "assignee": t.assignee, "status": t.status,
                     "tenant": t.tenant, "priority": t.priority,
+                    "review_required": t.review_required,
                     "workspace_kind": t.workspace_kind,
                     "workspace_path": t.workspace_path,
                     "created_by": t.created_by, "created_at": t.created_at,
@@ -801,7 +803,8 @@ def _handle_complete(args: dict, **kw) -> str:
                 )
             if not ok:
                 return tool_error(
-                    f"could not complete {tid} (unknown id or already terminal)"
+                    f"could not complete {tid}: "
+                    f"{getattr(kb.get_task(conn, tid), 'last_failure_error', None) or 'unknown id or already terminal'}"
                 )
             run = kb.latest_run(conn, tid)
             return _ok(task_id=tid, run_id=run.id if run else None)
@@ -831,6 +834,12 @@ def _handle_block(args: dict, **kw) -> str:
     if not reason or not str(reason).strip():
         return tool_error("reason is required — explain what input you need")
     reason = redact_sensitive_text(str(reason), force=True)
+    metadata = args.get("metadata")
+    if metadata is not None and not isinstance(metadata, dict):
+        return tool_error("metadata must be an object")
+    metadata = json.loads(redact_sensitive_text(json.dumps(metadata or {}), force=True))
+    metadata = _stamp_worker_session_metadata(tid, metadata)
+    summary = redact_sensitive_text(str(args.get("summary") or ""), force=True) or None
     kind = args.get("kind")
     board = args.get("board")
     try:
@@ -868,6 +877,7 @@ def _handle_block(args: dict, **kw) -> str:
             ok = kb.block_task(
                 conn, tid,
                 reason=reason,
+                summary=summary, metadata=metadata,
                 kind=kind,
                 expected_run_id=_worker_run_id(tid),
             )
@@ -1441,6 +1451,7 @@ def _handle_create(args: dict, **kw) -> str:
                 parents=tuple(parents),
                 tenant=tenant,
                 priority=int(priority) if priority is not None else 0,
+                review_required=args.get("review_required", False),
                 workspace_kind=str(workspace_kind),
                 workspace_path=workspace_path,
                 project_id=project_id,
@@ -1894,6 +1905,8 @@ KANBAN_BLOCK_SCHEMA = {
                     "Omit only if none apply."
                 ),
             },
+            "summary": {"type": "string", "description": "Completed work and continuation context."},
+            "metadata": {"type": "object", "additionalProperties": True, "description": "Retained deliverables, verification and continuation facts."},
             "board": _board_schema_prop(),
         },
         "required": ["reason"],
@@ -2188,6 +2201,7 @@ KANBAN_CREATE_SCHEMA = {
                     "when multiple ready tasks share an assignee."
                 ),
             },
+            "review_required": {"type": "boolean", "description": "Require independent same-card review of the persistent repository deliverables before completion."},
             "workspace_kind": {
                 "type": "string",
                 "enum": ["scratch", "dir", "worktree"],

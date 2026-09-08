@@ -597,6 +597,7 @@ def get_task(
 # ---------------------------------------------------------------------------
 
 class CreateTaskBody(BaseModel):
+    review_required: bool = False
     title: str
     body: Optional[str] = None
     assignee: Optional[str] = None
@@ -628,6 +629,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
     try:
         task_id = kanban_db.create_task(
             conn,
+            review_required=payload.review_required,
             title=payload.title,
             body=payload.body,
             assignee=payload.assignee,

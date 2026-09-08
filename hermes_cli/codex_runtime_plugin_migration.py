@@ -551,10 +551,10 @@ def _build_hermes_tools_mcp_entry() -> dict:
 
     out: dict[str, Any] = {
         "command": sys.executable,
-        "args": ["-m", "agent.transports.hermes_tools_mcp_server"],
+        "args": ["-P", "-m", "agent.transports.hermes_tools_mcp_server"],
         # MCP processes need the dispatcher's board and run identity.
         "env_vars": [
-            "HERMES_HOME", "HERMES_PROFILE", "TERMINAL_CWD",
+            "HERMES_HOME", "HERMES_PROFILE", "HERMES_SESSION_ID", "TERMINAL_CWD",
             "HERMES_KANBAN_TASK", "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD",
             "HERMES_KANBAN_HOME", "HERMES_KANBAN_ROOT",
             "HERMES_KANBAN_WORKSPACE", "HERMES_KANBAN_WORKSPACES_ROOT",

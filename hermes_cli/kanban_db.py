@@ -1093,6 +1093,7 @@ class Task:
     # --skills). Stored as a JSON array of skill names. None = use only
     # the defaults; empty list = explicitly no extra skills.
     skills: Optional[list] = None
+    review_required: bool = False
     model_override: Optional[str] = None
     # Provider that ``model_override`` belongs to. When set, the dispatcher
     # passes ``--provider <name>`` alongside ``-m <model>`` so the worker
@@ -1203,6 +1204,7 @@ class Task:
             current_step_key=(
                 row["current_step_key"] if "current_step_key" in keys else None
             ),
+            review_required=bool(row["review_required"]) if "review_required" in keys else False,
             skills=skills_value,
             model_override=row["model_override"] if "model_override" in keys and row["model_override"] else None,
             provider_override=(
@@ -2634,6 +2636,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # they were getting before the column existed).
         _add_column_if_missing(conn, "tasks", "max_retries", "max_retries INTEGER")
 
+    _add_column_if_missing(conn, "tasks", "review_required", "review_required INTEGER NOT NULL DEFAULT 0")
+
     if "model_override" not in cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN model_override TEXT")
 
@@ -3171,6 +3175,7 @@ def create_task(
     *,
     title: str,
     body: Optional[str] = None,
+    review_required: bool = False,
     assignee: Optional[str] = None,
     created_by: Optional[str] = None,
     workspace_kind: str = "scratch",
@@ -3419,6 +3424,10 @@ def create_task(
         if row:
             return row["id"]
 
+    if not isinstance(review_required, bool):
+        raise ValueError("review_required must be a boolean")
+    if review_required and workspace_kind == "scratch":
+        raise ValueError("Required review needs a persistent repository workspace")
     now = int(time.time())
 
     # Resolve workspace_path from board-level default_workdir when the
@@ -3508,8 +3517,8 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, review_required
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3535,6 +3544,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        int(review_required),
                     ),
                 )
                 for pid in parents:
@@ -5445,6 +5455,16 @@ def complete_task(
         # ``review`` or ``running``.
         if not _parents_satisfied(conn, task_id):
             return False
+        task = get_task(conn, task_id)
+        if task and task.status in {"done", "archived"}:
+            return False
+        if task and task.review_required:
+            from hermes_cli.kanban_review import completion_rejection
+            rejection = completion_rejection(conn, task, metadata, expected_run_id)
+            if rejection:
+                _append_event(conn, task_id, "completion_blocked_review", {"reason": rejection})
+                conn.execute("UPDATE tasks SET last_failure_error = ? WHERE id = ?", (rejection, task_id))
+                return False
         prior = conn.execute(
             "SELECT status FROM tasks WHERE id = ?",
             (task_id,),
@@ -6259,6 +6279,8 @@ def block_task(
     task_id: str,
     *,
     reason: Optional[str] = None,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
@@ -6338,11 +6360,11 @@ def block_task(
             run_id = _end_run(
                 conn, task_id,
                 outcome="blocked", status="blocked",
-                summary=reason,
+                summary=summary or reason, metadata=metadata,
             )
-            if run_id is None and reason:
+            if run_id is None and (reason or summary or metadata):
                 run_id = _synthesize_ended_run(
-                    conn, task_id, outcome="blocked", summary=reason,
+                    conn, task_id, outcome="blocked", summary=summary or reason, metadata=metadata,
                 )
             _append_event(
                 conn, task_id, "dependency_wait",
@@ -6396,11 +6418,11 @@ def block_task(
             run_id = _end_run(
                 conn, task_id,
                 outcome="blocked", status="blocked",
-                summary=reason,
+                summary=summary or reason, metadata=metadata,
             )
-            if run_id is None and reason:
+            if run_id is None and (reason or summary or metadata):
                 run_id = _synthesize_ended_run(
-                    conn, task_id, outcome="blocked", summary=reason,
+                    conn, task_id, outcome="blocked", summary=summary or reason, metadata=metadata,
                 )
             _append_event(
                 conn, task_id, "block_loop_detected",
@@ -6450,15 +6472,15 @@ def block_task(
             run_id = _end_run(
                 conn, task_id,
                 outcome="blocked", status="blocked",
-                summary=reason,
+                summary=summary or reason, metadata=metadata,
             )
             # Synthesize a run when blocking a never-claimed task so the
             # reason is preserved in attempt history.
-            if run_id is None and reason:
+            if run_id is None and (reason or summary or metadata):
                 run_id = _synthesize_ended_run(
                     conn, task_id,
                     outcome="blocked",
-                    summary=reason,
+                    summary=summary or reason, metadata=metadata,
                 )
             _append_event(
                 conn, task_id, "blocked",
@@ -6557,6 +6579,18 @@ def request_review(
                 "(worker ownership) or force=True (explicit operator "
                 "override) instead of clearing the live run's claim",
             )
+        task = get_task(conn, task_id)
+        review_state = None
+        if task.review_required:
+            from hermes_cli.kanban_review import capture_state
+            if (trow["status"] != "running" or expected_run_id is None
+                    or trow["current_run_id"] != expected_run_id
+                    or _retry_status_for_run(conn, task_id, expected_run_id) == "review"):
+                return _ret(False, "Required review must be submitted by the active developer run")
+            if not summary or not metadata or not metadata.get("worker_session_id"):
+                return _ret(False, "Required review needs a summary and developer session identity")
+            review_state = capture_state(task)
+            metadata = dict(metadata, review_state=review_state)
         implementer = trow["assignee"]
         if reviewer is None:
             changes_run = conn.execute(
@@ -6652,6 +6686,7 @@ def request_review(
             "review_requested",
             {
                 "summary": event_summary or None,
+                "review_state_id": review_state["id"] if review_state else None,
                 "implementer": implementer,
                 "reviewer": reviewer,
             },
@@ -11075,6 +11110,18 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     lines.append("")
     lines.append(f"Assignee: {task.assignee or '(unassigned)'}")
     lines.append(f"Status:   {task.status}")
+    lines.append(f"Independent review required: {task.review_required}")
+    if task.review_required:
+        from hermes_cli.kanban_review import latest_submission
+        submission = latest_submission(conn, task.id)
+        if submission:
+            lines.append(f"Submitted review state: {submission['state']['id']}")
+        lines.append("Use same-card review. The developer requests review after verification. "
+                     "The reviewer records findings in comments, keeps deliverables unchanged, "
+                     "and completes with metadata.review_outcome='approved', "
+                     "metadata.reviewed_state_id set to the submitted state, and metadata.reviewer_checks. "
+                     "Changed deliverables require a developer resubmission. "
+                     "Use kanban_request_changes for concrete corrections.")
     if task.tenant:
         lines.append(f"Tenant:   {task.tenant}")
     lines.append(f"Workspace: {task.workspace_kind} @ {task.workspace_path or '(unresolved)'}")

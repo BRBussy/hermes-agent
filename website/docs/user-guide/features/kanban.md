@@ -52,6 +52,18 @@ They look similar; they are not the same primitive.
 
 They coexist: a kanban worker may call `delegate_task` internally during its run.
 
+## Required repository review
+
+Create a persistent repository card with `review_required=true` through the worker tool or dashboard API, or `--review-required` through the CLI. The creation flag remains attached to the card across recovery and correction. Existing cards default to optional review.
+
+The active developer requests same-card review with a summary and recorded session identity. The runtime stores a state receipt in the review-request run metadata. Its identity covers the repository root, HEAD, branch, index, tracked contents and file modes, non-ignored untracked files, and the card title and body. The receipt retains individual hashes for changed files and a digest of the full file set. Ignored build outputs are outside this contract. Symbolic links and nested repositories are rejected. Retained deliverables must be regular, non-ignored repository files.
+
+A separate reviewer run inspects the actual deliverables and records its checks in comments. It requests corrections through the existing changes-request operation, which returns the same card to the developer. The developer corrects and resubmits. For acceptance, completion metadata must include `review_outcome` equal to `approved`, the `reviewed_state_id` shown in the submitted receipt, and non-empty `reviewer_checks`. Developer and reviewer session identities must differ.
+
+Completion checks the active reviewer claim and submitted state under the shared board write transaction. Pending review, outstanding corrections, a reclaimed run, missing evidence or changed deliverables prevent completion. The card and workspace remain available for correction. Acceptance and completion form one transition, with one completion event. This gate is a completion-time snapshot, not a filesystem lock against unrelated writers or an OS permission boundary against direct database edits. Acceptance does not grant permission to publish or change Git history.
+
+`kanban_block` accepts `summary` and `metadata` for durable partial work and continuation facts. Findings stored as comments survive reviewer reclaim. Use the same card for recovery and relevant corrections.
+
 ## Core concepts
 
 - **Board** — a standalone queue of tasks with its own SQLite DB, workspaces
