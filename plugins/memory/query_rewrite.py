@@ -27,7 +27,7 @@ _QUESTION_START_RE = re.compile(
     re.IGNORECASE,
 )
 _MEMORY_GROUNDING_RE = re.compile(
-    r"\b(?:user|their|they|them|previous|prior|past|history|preference|"
+    r"\b(?:user|their|they|them|previous(?:ly)?|prior|past|history|preference|"
     r"preferences|context|known|remembered|earlier)\b",
     re.IGNORECASE,
 )

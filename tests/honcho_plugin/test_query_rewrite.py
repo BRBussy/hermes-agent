@@ -26,6 +26,10 @@ def _response(text: str):
     ("raw", "expected"),
     [
         (
+            "What notebook label did I previously choose for my LARCH project?",
+            "What notebook label did I previously choose for my LARCH project?",
+        ),
+        (
             "What prior travel plans or preferences does the user have for Prague?",
             "What prior travel plans or preferences does the user have for Prague?",
         ),

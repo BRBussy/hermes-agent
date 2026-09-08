@@ -136,8 +136,11 @@ def _parse_scores(content: str, n_items: int) -> Dict[int, Dict[str, Any]]:
             if not isinstance(obj, dict):
                 continue
             idx = obj.get("index")
-            if isinstance(idx, int) and 0 <= idx < n_items:
-                out[idx] = obj
+            score = obj.get("score")
+            if (type(idx) is not int or not 0 <= idx < n_items or idx in out
+                    or type(score) is not int or not 0 <= score <= 10):
+                return {}
+            out[idx] = obj
     return out
 
 
@@ -165,7 +168,10 @@ def main() -> int:
     try:
         resp = call_llm(
             task="monitor",
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                {"role": "system", "content": _CLASSIFY_INSTRUCTIONS},
+                {"role": "user", "content": prompt},
+            ],
             max_tokens=1024,
             temperature=0,
         )
@@ -179,6 +185,9 @@ def main() -> int:
         return 4
 
     scores = _parse_scores(content, len(items))
+    if len(scores) != len(items):
+        _eprint("classify_items: classifier must return one valid score per item")
+        return 5
     surfaced = []
     for i, item in enumerate(items):
         s = scores.get(i)
