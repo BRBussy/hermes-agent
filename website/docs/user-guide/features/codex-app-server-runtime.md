@@ -98,7 +98,11 @@ What also works because the MCP callback exposes them:
 - **`kanban_show` / `kanban_list`** — read-only board queries for the worker to check its own context.
 - **`kanban_create` / `kanban_unblock` / `kanban_link`** — orchestrator-only operations. Available for orchestrator agents running on the codex runtime that need to dispatch new tasks.
 
-The kanban tools are gated by `HERMES_KANBAN_TASK` env var the dispatcher sets — that var is propagated to the codex subprocess (codex inherits env) and from there to the spawned `hermes-tools` MCP server subprocess. So the tools see the right task id and gate correctly. For Codex app-server workers, Hermes also passes narrow app-server sandbox overrides when `HERMES_KANBAN_TASK` is present: keep `workspace-write` sandboxing, add the **board DB directory plus every Kanban path the dispatcher pinned** as extra writable roots (`HERMES_KANBAN_WORKSPACES_ROOT`, `HERMES_KANBAN_WORKSPACE`, legacy `HERMES_KANBAN_ROOT` — deduplicated, DB-dir first), and keep network disabled by default. This avoids the brittle `:danger-no-sandbox` workaround while letting `kanban_complete` / `kanban_block` update the board DB **and** letting workers write reports/artifacts under workspace mounts that live outside the DB directory (e.g. `/media/.../kanban-workspaces/...` on a separate drive — [issue #27941](https://github.com/NousResearch/hermes-agent/issues/27941)).
+The dispatcher passes the task, board, database, workspace, branch and run identity to the worker. The Hermes MCP entry forwards this context at launch. Kanban tools use it to update the assigned board.
+
+Codex workers use the workspace-write sandbox. The board database directory is an additional writable root. The worker profile's `kanban.codex_network_access` configuration controls outbound network access. It defaults to `false` and accepts only YAML booleans. Setting it to `true` permits repository and dependency network operations while retaining filesystem confinement. This setting does not provide a domain allowlist.
+
+Normal and review dispatch record the resolved workspace path and branch before passing that same context to the worker.
 
 ### Cron jobs
 

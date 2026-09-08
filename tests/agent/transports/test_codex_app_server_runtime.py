@@ -209,12 +209,8 @@ class TestSpawnEnvIsolation:
         # And HOME still passes through unchanged
         assert captured["env"].get("HOME") == "/users/alice"
 
-    def test_kanban_worker_adds_only_kanban_writable_root(self, monkeypatch):
-        """Codex-runtime Kanban workers need to write board state outside
-        their scratch/worktree workspace, but should not fall back to
-        danger-full-access. Hermes passes a narrow app-server config override
-        for the Kanban root only.
-        """
+    @pytest.mark.parametrize("network_access", [None, False, True, "true"])
+    def test_kanban_worker_adds_only_kanban_writable_root(self, monkeypatch, network_access):
         import subprocess
         from agent.transports import codex_app_server as cas
 
@@ -245,12 +241,19 @@ class TestSpawnEnvIsolation:
         monkeypatch.setattr(subprocess, "Popen", FakePopen)
         monkeypatch.setenv("HOME", "/users/alice")
         monkeypatch.setenv("HERMES_HOME", "/users/alice/.hermes/profiles/backend-worker")
+        monkeypatch.setattr("hermes_cli.config.load_config_readonly",
+                            lambda: {"kanban": {} if network_access is None else {"codex_network_access": network_access}})
         monkeypatch.setenv("HERMES_KANBAN_TASK", "t_smoke")
         monkeypatch.setenv(
             "HERMES_KANBAN_DB",
             "/users/alice/.hermes/kanban/boards/smoke/kanban.db",
         )
 
+        if isinstance(network_access, str):
+            with pytest.raises(ValueError, match="must be a boolean"):
+                cas.CodexAppServerClient(codex_bin="codex")
+            assert not captured
+            return
         client = cas.CodexAppServerClient(codex_bin="codex")
         client._closed = True
 
@@ -261,7 +264,7 @@ class TestSpawnEnvIsolation:
             'sandbox_workspace_write.writable_roots=["/users/alice/.hermes/kanban/boards/smoke"]'
             in cmd
         )
-        assert "sandbox_workspace_write.network_access=false" in cmd
+        assert f"sandbox_workspace_write.network_access={str(network_access is True).lower()}" in cmd
         assert all("danger" not in part for part in cmd)
 
 

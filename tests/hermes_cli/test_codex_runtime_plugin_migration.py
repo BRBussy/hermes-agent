@@ -389,3 +389,19 @@ class TestHermesProfileEnvironment:
         entry = _build_hermes_tools_mcp_entry()
         assert "HERMES_HOME" in entry["env_vars"]
         assert "HERMES_HOME" not in entry.get("env", {})
+
+
+@pytest.mark.parametrize("value", [None, "dispatcher-value"])
+def test_mcp_inherits_worker_identity_at_launch(monkeypatch, value):
+    keys = {"HERMES_KANBAN_TASK", "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD",
+            "HERMES_KANBAN_WORKSPACE", "HERMES_KANBAN_BRANCH",
+            "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_CLAIM_LOCK", "HERMES_PROFILE"}
+    assert keys
+    for key in keys:
+        if value is None:
+            monkeypatch.delenv(key, raising=False)
+        else:
+            monkeypatch.setenv(key, value)
+    entry = _build_hermes_tools_mcp_entry()
+    assert keys <= set(entry["env_vars"])
+    assert not keys.intersection(entry.get("env", {}))
