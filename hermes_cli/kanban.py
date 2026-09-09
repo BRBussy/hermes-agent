@@ -629,6 +629,15 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_comment.add_argument("--max-len", type=int, default=None,
                            help="Trim the stored comment body to this many characters")
 
+    p_dispose = sub.add_parser("dispose", help="Retire an authorised task workspace with complete recovery storage")
+    p_dispose.add_argument("task_id")
+    p_dispose.add_argument("--request-id", required=True)
+    p_dispose.add_argument("--authority", required=True)
+    p_dispose.add_argument("--head", required=True)
+    p_dispose.add_argument("--remote", required=True)
+    p_dispose.add_argument("--ref", required=True)
+    p_dispose.add_argument("--dry-run", action="store_true")
+
     p_evidence = sub.add_parser("evidence", help="Verify or recover retained task evidence")
     p_evidence.add_argument("task_id")
     p_evidence.add_argument("--manifest", type=int)
@@ -1192,6 +1201,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "attach":   _cmd_attach,
             "attachments": _cmd_attachments,
             "evidence": _cmd_evidence,
+            "dispose": _cmd_dispose,
             "attach-rm": _cmd_attach_rm,
             "complete": _cmd_complete,
             "edit":     _cmd_edit,
@@ -1865,6 +1875,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
         attempt_diagnostics = diagnostics(conn, args.task_id)
         from hermes_cli.kanban_evidence import discover
         evidence = discover(conn, args.task_id)
+        from hermes_cli.kanban_disposal import inspect
+        disposal = inspect(conn, args.task_id)
         # Workers hand off via ``task_runs.summary``; ``tasks.result`` is left NULL unless the caller explicitly passed
         # ``result=``. Surfacing the latest summary here keeps ``show`` from
         # looking like a no-op when the worker actually did real work.
@@ -1878,6 +1890,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
             "latest_summary": latest_summary,
             "attempts": attempt_diagnostics,
             "evidence": evidence,
+            "disposal": disposal,
             "parents": parents,
             "children": children,
             "comments": [
@@ -1915,6 +1928,9 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
     print(f"Task {task.id}: {task.title}")
     print(f"  status:    {task.status}")
+    print(f"  workspace state: {disposal['state']}")
+    for receipt in disposal['receipts']:
+        print(f"  disposal: {receipt['outcome']}: {receipt.get('reason', '')}")
     print(f"  assignee:  {task.assignee or '-'}")
     if task.tenant:
         print(f"  tenant:    {task.tenant}")
@@ -2319,6 +2335,16 @@ def _cmd_attach(args: argparse.Namespace) -> int:
         return 1
     print(f"Attached {name} to {args.task_id} (attachment {att_id}, {len(data)} bytes)")
     return 0
+
+
+def _cmd_dispose(args: argparse.Namespace) -> int:
+    from hermes_cli.kanban_disposal import dispose
+    with kb.connect_closing() as conn:
+        result = dispose(conn, args.task_id, request_id=args.request_id,
+                         authority=args.authority, expected_head=args.head,
+                         remote=args.remote, ref=args.ref, dry_run=args.dry_run)
+    print(json.dumps(result, indent=2))
+    return 0 if result['outcome'] in {'removed', 'retained'} else 1
 
 
 def _cmd_evidence(args: argparse.Namespace) -> int:

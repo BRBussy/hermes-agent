@@ -295,7 +295,7 @@ def finalize_subagent_worktree(
                 f"{counted.stderr.strip()[:200]}"
             )
             unmeasured.append("commits")
-        status = _run_git(["status", "--porcelain"], cwd=path)
+        status = _run_git(["status", "--porcelain", "--ignored", "--untracked-files=all"], cwd=path)
         if status.returncode == 0:
             payload["dirty"] = bool(status.stdout.strip())
         else:

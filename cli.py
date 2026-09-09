@@ -1605,30 +1605,24 @@ def _cleanup_failed_worktree_add(repo_root: str, wt_path: Path, branch_name: str
     ) == "live":
         return
 
-    import shutil
+    if _worktree_is_dirty(str(wt_path), timeout=10):
+        return
+
     import subprocess
 
-    def _git(*args: str) -> None:
-        try:
-            subprocess.run(
-                ["git", *args],
-                capture_output=True, text=True, timeout=15, cwd=repo_root, check=False,
-            )
-        except Exception:
-            pass
-
     try:
-        # Unlock first: `worktree remove --force` refuses a locked tree.
-        _git("worktree", "unlock", str(wt_path))
-        _git("worktree", "remove", "--force", str(wt_path))
-        if wt_path.exists():
-            shutil.rmtree(wt_path, ignore_errors=True)
-        # Drop the orphaned admin entry when the dir is already gone
-        # (`remove` needs the dir; `prune` handles the dirless case).
-        _git("worktree", "prune")
-        _git("branch", "-D", branch_name)
-    except Exception as e:
-        logger.debug("cleanup after failed worktree add: %s", e)
+        removed = subprocess.run(
+            ["git", "worktree", "remove", str(wt_path)],
+            capture_output=True, text=True, timeout=15, cwd=repo_root,
+        )
+        if removed.returncode or wt_path.exists():
+            return
+        subprocess.run(
+            ["git", "branch", "-d", branch_name],
+            capture_output=True, text=True, timeout=15, cwd=repo_root,
+        )
+    except Exception as exc:
+        logger.debug("Cleanup after failed worktree add: %s", exc)
 
 
 _PACK_SPRAWL_THRESHOLD = 15
@@ -2037,20 +2031,9 @@ def _setup_worktree(repo_root: str = None, sync_base: bool = True,
 
 
 def _worktree_has_unpushed_commits(worktree_path: str, timeout: int = 10) -> bool:
-    """Return whether a worktree has commits not reachable from any remote branch.
+    """Treat absent or unverifiable remote-tracking history as unpublished.
 
-    ``git log HEAD --not --remotes`` compares against remote-tracking refs under
-    ``refs/remotes/*``. If a repo has no remote-tracking refs yet, there is no
-    usable remote baseline to compare against, so treat it as having no
-    "unpushed" commits.
-
-    SHALLOW-CLONE CAVEAT: in a shallow clone (the installer default) the
-    shallow boundary can disconnect an older worktree HEAD from origin/*,
-    making already-public commits look unpushed. The verdict here stays
-    conservative (True) on purpose — deleting on unverifiable history would
-    risk real work. Callers that can afford it should deepen first via
-    ``_deepen_shallow_repo`` (the startup pruner does) or check
-    ``_repo_is_shallow`` before presenting this verdict as fact.
+    This cache observation is insufficient authority for task disposal.
     """
     import subprocess
 
@@ -2062,7 +2045,7 @@ def _worktree_has_unpushed_commits(worktree_path: str, timeout: int = 10) -> boo
         if remote_refs.returncode != 0:
             return True
         if not remote_refs.stdout.strip():
-            return False
+            return True
 
         result = subprocess.run(
             ["git", "log", "--oneline", "HEAD", "--not", "--remotes"],
@@ -2077,7 +2060,7 @@ def _worktree_has_unpushed_commits(worktree_path: str, timeout: int = 10) -> boo
 
 def _worktree_is_dirty(worktree_path: str, timeout: int = 10) -> bool:
     """Return whether a worktree has uncommitted changes (staged, unstaged, or
-    untracked).
+    untracked or ignored).
 
     Fails SAFE: on any error returns True so callers do not delete a worktree
     whose state they cannot determine.
@@ -2086,7 +2069,7 @@ def _worktree_is_dirty(worktree_path: str, timeout: int = 10) -> bool:
 
     try:
         result = subprocess.run(
-            ["git", "status", "--porcelain"],
+            ["git", "status", "--porcelain", "--ignored", "--untracked-files=all"],
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, cwd=worktree_path,
         )
         if result.returncode != 0:
@@ -2540,6 +2523,10 @@ def _cleanup_worktree(info: Dict[str, str] = None) -> None:
         _active_worktree = None
         return
 
+    if _worktree_is_dirty(wt_path, timeout=10):
+        _active_worktree = None
+        return
+
     has_unpushed = _worktree_has_unpushed_commits(wt_path, timeout=10)
 
     if has_unpushed:
@@ -2557,10 +2544,6 @@ def _cleanup_worktree(info: Dict[str, str] = None) -> None:
         _active_worktree = None
         return
 
-    # Remove worktree (even if working tree is dirty — uncommitted
-    # changes without unpushed commits are just artifacts)
-    # Unlock first so `git worktree remove` isn't blocked by the lock we
-    # placed at creation time.  Fail-soft — never block cleanup.
     try:
         subprocess.run(
             ["git", "worktree", "unlock", wt_path],
@@ -2570,21 +2553,21 @@ def _cleanup_worktree(info: Dict[str, str] = None) -> None:
         logger.debug("git worktree unlock failed (non-fatal): %s", e)
 
     try:
-        subprocess.run(
-            ["git", "worktree", "remove", wt_path, "--force"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15, cwd=repo_root,
+        removed = subprocess.run(
+            ["git", "worktree", "remove", wt_path],
+            capture_output=True, text=True, timeout=15, cwd=repo_root,
         )
-    except Exception as e:
-        logger.debug("Failed to remove worktree: %s", e)
-
-    # Delete the branch
-    try:
+        if removed.returncode:
+            _active_worktree = None
+            return
         subprocess.run(
-            ["git", "branch", "-D", branch],
-            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, cwd=repo_root,
+            ["git", "branch", "-d", branch],
+            capture_output=True, text=True, timeout=10, cwd=repo_root,
         )
-    except Exception as e:
-        logger.debug("Failed to delete branch %s: %s", branch, e)
+    except Exception as exc:
+        logger.debug("Worktree cleanup failed: %s", exc)
+        _active_worktree = None
+        return
 
     _active_worktree = None
     _cprint(f"\033[32m✓ Worktree cleaned up: {wt_path}\033[0m")
@@ -3036,6 +3019,12 @@ def _prune_orphaned_branches(repo_root: str, protect: Optional[set] = None) -> N
     except Exception:
         pass
     active_branches.add("main")
+
+    from hermes_cli.kanban_disposal import recovery_branches
+    recovery = recovery_branches(repo_root)
+    if recovery is None:
+        return
+    active_branches.update(recovery)
 
     orphaned = [
         b for b in all_branches

@@ -538,6 +538,8 @@ def _handle_show(args: dict, **kw) -> str:
             events = kb.list_events(conn, tid)
             from hermes_cli.kanban_evidence import discover
             evidence = discover(conn, tid)
+            from hermes_cli.kanban_disposal import inspect
+            disposal = inspect(conn, tid)
             runs = kb.list_runs(conn, tid)
             parents = kb.parent_ids(conn, tid)
             children = kb.child_ids(conn, tid)
@@ -571,6 +573,7 @@ def _handle_show(args: dict, **kw) -> str:
             return json.dumps({
                 "task": _task_dict(task),
                 "evidence": evidence,
+                "disposal": disposal,
                 "parents": parents,
                 "children": children,
                 "comments": [

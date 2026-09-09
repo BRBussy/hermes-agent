@@ -754,7 +754,14 @@ def worktree_add(cwd: str, options: dict) -> dict:
 
 
 def worktree_remove(cwd: str, worktree_path: str, force: bool) -> dict:
+    from pathlib import Path
+    from hermes_cli.kanban_worktree import is_retained
     root = _main_root(cwd)
+    target = Path(worktree_path)
+    if not target.is_absolute():
+        target = Path(root) / target
+    if is_retained(target):
+        raise ValueError('Retained task workspaces require explicit Kanban disposal')
     args = ["worktree", "remove"]
     if force:
         args.append("--force")

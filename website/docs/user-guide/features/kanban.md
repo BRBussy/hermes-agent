@@ -1192,3 +1192,13 @@ Kanban is deliberately single-host. `~/.hermes/kanban.db` is a local SQLite file
 ## Design spec
 
 The complete design — architecture, concurrency correctness, comparison with other systems, implementation plan, risks, open questions — lives in `docs/hermes-kanban-v1-spec.pdf`. Read that before filing any behavior-change PR.
+
+## Explicit worktree disposal
+
+The operator's `dispose` subcommand retires a task worktree only with task-specific disposal authority, an exact approved HEAD, a selected remote and a full remote branch reference. Supply `--request-id`, `--authority`, `--head`, `--remote` and `--ref`. A unique request identifier identifies one decision. `--dry-run` records a retained decision after successful checks and leaves the workspace in place. Use a different request identifier for a later authorised retirement.
+
+The task must be terminal, without an active owning attempt or dependent child. Its registered repository, branch and managed retention lock must match. User locks remain protected. Tracked changes, shallow history, unverifiable remote state and unclassified content prevent retirement. Every ignored or untracked file requires matching verified evidence in the board's attachment store. A clean Git status or an earlier push does not establish disposal authority.
+
+Successful retirement moves the complete workspace directory and its per-worktree Git metadata into private recovery storage inside the common repository directory. It preserves the branch. This retires the active path and Git registration while retaining recovery bytes and any late writes through open file descriptors. It does not reclaim that disk space or provide independent backup coverage. Purging recovery storage requires a separate policy and authority.
+
+Task details expose disposal receipts, workspace availability and unexpected recreation of a retired path. Receipts distinguish `retained`, `refused`, `removed`, `failed` and `unknown`, and include authority, task/run identity, checks, timestamps and recovery references. Reusing a request identifier returns its recorded outcome without repeating filesystem actions. An interrupted operation requires reconciliation of its intent, original paths and recovery paths. Preserve both directories and branch references until ownership and contents are verified. Task and board ownership records remain retained after workspace retirement.

@@ -371,7 +371,12 @@ def audit_branches(repo_root: str) -> List[BranchRecord]:
                          cwd=repo_root, timeout=15)
     merged = {b.strip() for b in merged_result.stdout.splitlines() if b.strip()}
 
+    from hermes_cli.kanban_disposal import recovery_branches
+    recovery = recovery_branches(repo_root)
+
     def _classify_branch(branch: str) -> BranchRecord:
+        if recovery is None or branch in recovery:
+            return BranchRecord(branch, 'keep', 'task disposal recovery anchor')
         if branch in _PROTECTED_BRANCHES or branch in active:
             return BranchRecord(branch, "keep", "protected or checked out")
         if branch in merged:
@@ -429,6 +434,11 @@ def reclaim_branches(
             continue
         if dry_run:
             actions.append(f"would delete branch {record.name} ({record.reason})")
+            continue
+        from hermes_cli.kanban_disposal import recovery_branches
+        recovery = recovery_branches(repo_root)
+        if recovery is None or record.name in recovery:
+            actions.append(f'kept {record.name} (task disposal recovery anchor)')
             continue
         result = _git(["branch", "-D", record.name], cwd=repo_root, timeout=10)
         if result.returncode == 0:
