@@ -567,6 +567,7 @@ def get_task(
             })
         # Attach diagnostics so the drawer's Diagnostics section can
         # render recovery actions without a second round-trip.
+        from hermes_cli.kanban_evidence import discover
         diags = _compute_task_diagnostics(conn, task_ids=[task_id])
         diag_list = diags.get(task_id) or []
         if diag_list:
@@ -580,6 +581,7 @@ def get_task(
             "links": links,
             "child_results": child_results,
             "attempts": diagnostics(conn, task_id),
+            "evidence": discover(conn, task_id),
             "runs": [
                 _run_dict(r)
                 for r in kanban_db.list_runs(

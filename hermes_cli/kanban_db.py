@@ -4304,6 +4304,8 @@ def delete_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[
         att = get_attachment(conn, attachment_id)
         if att is None:
             return None
+        if att.uploaded_by in {'retained-evidence', 'evidence-manifest'}:
+            raise ArtifactPreservationError('Required evidence is retained. Explicit disposal policy is required')
         conn.execute("DELETE FROM task_attachments WHERE id = ?", (attachment_id,))
         _append_event(
             conn, att.task_id, "attachment_removed", {"filename": att.filename}
@@ -4391,6 +4393,9 @@ def _end_run(
     if not row or not row["current_run_id"]:
         return None
     run_id = int(row["current_run_id"])
+    if outcome != 'completed':
+        from hermes_cli.kanban_evidence import preserve
+        metadata = preserve(conn, task_id, metadata, outcome)
     from hermes_cli.kanban_recovery import diagnostics
     attempt_records = diagnostics(conn, task_id)
     if attempt_records:
@@ -4465,6 +4470,9 @@ def _synthesize_ended_run(
     (or for clearing it elsewhere in the same txn) since this
     function does NOT touch the tasks row.
     """
+    if outcome != 'completed':
+        from hermes_cli.kanban_evidence import preserve
+        metadata = preserve(conn, task_id, metadata, outcome)
     now = int(time.time())
     trow = conn.execute(
         "SELECT assignee, current_step_key FROM tasks WHERE id = ?",
@@ -5406,8 +5414,7 @@ class HallucinatedCardsError(ValueError):
         )
 
 
-class ArtifactPreservationError(RuntimeError):
-    """Raised when a declared scratch deliverable cannot be preserved."""
+from hermes_cli.kanban_evidence import EvidenceError as ArtifactPreservationError
 
 
 def complete_task(
@@ -5547,18 +5554,9 @@ def complete_task(
             )
         if cur.rowcount != 1:
             return False
-        if isinstance(metadata, dict):
-            _persist_scratch_completion_artifacts(conn, task_id, metadata)
-            for stored_path in metadata.pop("_staged_artifacts", []):
-                path = Path(stored_path)
-                _insert_completion_attachment(
-                    conn,
-                    task_id,
-                    filename=path.name,
-                    stored_path=str(path),
-                    size=path.stat().st_size,
-                    created_at=now,
-                )
+        from hermes_cli.kanban_evidence import preserve, require_retained
+        metadata = preserve(conn, task_id, metadata, 'completed')
+        require_retained(conn, task_id)
         run_id = _end_run(
             conn, task_id,
             outcome="completed", status="done",
@@ -5713,156 +5711,6 @@ def _merge_completion_prose_artifacts(
             seen.add(path)
     updated["artifacts"] = merged
     return updated
-
-
-def _persist_scratch_completion_artifacts(
-    conn: sqlite3.Connection,
-    task_id: str,
-    metadata: dict,
-) -> None:
-    """Copy scratch-workspace completion artifacts before cleanup removes them."""
-    raw_artifacts = metadata.get("artifacts")
-    if not isinstance(raw_artifacts, (list, tuple)):
-        return
-
-    row = conn.execute(
-        "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
-        (task_id,),
-    ).fetchone()
-    if not row or row["workspace_kind"] != "scratch" or not row["workspace_path"]:
-        return
-
-    workspace = Path(row["workspace_path"]).expanduser()
-    is_managed, board = _managed_scratch_path_info(workspace)
-    if not is_managed:
-        return
-
-    try:
-        workspace_root = workspace.resolve()
-    except OSError:
-        return
-
-    attachment_dir = task_attachments_dir(task_id, board=board)
-    persisted: list[str] = []
-    used_destinations: set[Path] = set()
-    changed = False
-
-    def _discard_copies() -> None:
-        for copied in used_destinations:
-            try:
-                copied.unlink(missing_ok=True)
-            except OSError:
-                pass
-        try:
-            attachment_dir.rmdir()
-        except OSError:
-            pass
-
-    for item in raw_artifacts:
-        artifact = str(item).strip() if isinstance(item, str) else ""
-        if not artifact:
-            continue
-        src = Path(artifact).expanduser()
-        try:
-            resolved_src = src.resolve()
-        except OSError:
-            persisted.append(artifact)
-            continue
-
-        if not resolved_src.is_relative_to(workspace_root):
-            persisted.append(artifact)
-            continue
-
-        if not src.is_file():
-            _discard_copies()
-            raise ArtifactPreservationError(
-                f"declared scratch artifact is unavailable or not a regular file: {artifact}"
-            )
-
-        size = resolved_src.stat().st_size
-        if size > KANBAN_ATTACHMENT_MAX_BYTES:
-            _discard_copies()
-            raise ArtifactPreservationError(
-                f"declared scratch artifact exceeds the "
-                f"{KANBAN_ATTACHMENT_MAX_BYTES}-byte limit: {artifact}"
-            )
-
-        dest: Optional[Path] = None
-        try:
-            attachment_dir.mkdir(parents=True, exist_ok=True)
-            dest = _unique_attachment_path(attachment_dir, resolved_src.name, used_destinations)
-            with resolved_src.open("rb") as source_file, dest.open("xb") as destination_file:
-                copied = 0
-                while chunk := source_file.read(1024 * 1024):
-                    copied += len(chunk)
-                    if copied > KANBAN_ATTACHMENT_MAX_BYTES:
-                        raise ArtifactPreservationError(
-                            f"declared scratch artifact grew beyond the size limit: {artifact}"
-                        )
-                    destination_file.write(chunk)
-        except Exception as exc:
-            if dest is not None:
-                try:
-                    dest.unlink(missing_ok=True)
-                except OSError:
-                    pass
-            _discard_copies()
-            if isinstance(exc, ArtifactPreservationError):
-                raise
-            raise ArtifactPreservationError(
-                f"could not preserve declared scratch artifact {artifact}: {exc}"
-            ) from exc
-
-        used_destinations.add(dest)
-        persisted.append(str(dest.resolve()))
-        changed = True
-
-    if changed:
-        metadata["artifacts"] = persisted
-        metadata["_staged_artifacts"] = [
-            path for path in persisted if path.startswith(str(attachment_dir.resolve()))
-        ]
-
-
-def _insert_completion_attachment(
-    conn: sqlite3.Connection,
-    task_id: str,
-    *,
-    filename: str,
-    stored_path: str,
-    size: int,
-    created_at: int,
-) -> None:
-    """Record a worker-produced artifact in the existing attachment table."""
-    conn.execute(
-        "INSERT INTO task_attachments "
-        "(task_id, filename, stored_path, content_type, size, uploaded_by, created_at) "
-        "VALUES (?, ?, ?, NULL, ?, 'kanban_complete', ?)",
-        (task_id, filename, stored_path, size, created_at),
-    )
-    _append_event(
-        conn,
-        task_id,
-        "attached",
-        {"filename": filename, "size": size, "by": "kanban_complete"},
-    )
-
-
-def _unique_attachment_path(directory: Path, filename: str, used: set[Path]) -> Path:
-    """Return a non-conflicting path under ``directory`` for ``filename``."""
-    safe_name = Path(filename).name or "artifact"
-    candidate = directory / safe_name
-    if candidate not in used and not candidate.exists():
-        return candidate
-
-    stem = Path(safe_name).stem or "artifact"
-    suffix = Path(safe_name).suffix
-    idx = 1
-    while True:
-        candidate = directory / f"{stem}_{idx}{suffix}"
-        if candidate not in used and not candidate.exists():
-            return candidate
-        idx += 1
 
 
 def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:

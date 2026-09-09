@@ -629,6 +629,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_comment.add_argument("--max-len", type=int, default=None,
                            help="Trim the stored comment body to this many characters")
 
+    p_evidence = sub.add_parser("evidence", help="Verify or recover retained task evidence")
+    p_evidence.add_argument("task_id")
+    p_evidence.add_argument("--manifest", type=int)
+    p_evidence.add_argument("--recover")
+    p_evidence.add_argument("--import-archive")
+    p_evidence.add_argument("--register", nargs="+")
+
     # --- attach / attachments / attach-rm ---
     p_attach = sub.add_parser("attach", help="Attach a local file to a task")
     p_attach.add_argument("task_id")
@@ -1184,6 +1191,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "comment":  _cmd_comment,
             "attach":   _cmd_attach,
             "attachments": _cmd_attachments,
+            "evidence": _cmd_evidence,
             "attach-rm": _cmd_attach_rm,
             "complete": _cmd_complete,
             "edit":     _cmd_edit,
@@ -1855,6 +1863,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
         runs = kb.list_runs(conn, args.task_id, **rsk)
         from hermes_cli.kanban_recovery import diagnostics
         attempt_diagnostics = diagnostics(conn, args.task_id)
+        from hermes_cli.kanban_evidence import discover
+        evidence = discover(conn, args.task_id)
         # Workers hand off via ``task_runs.summary``; ``tasks.result`` is left NULL unless the caller explicitly passed
         # ``result=``. Surfacing the latest summary here keeps ``show`` from
         # looking like a no-op when the worker actually did real work.
@@ -1867,6 +1877,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
             "task": _task_to_dict(task),
             "latest_summary": latest_summary,
             "attempts": attempt_diagnostics,
+            "evidence": evidence,
             "parents": parents,
             "children": children,
             "comments": [
@@ -2307,6 +2318,25 @@ def _cmd_attach(args: argparse.Namespace) -> int:
         print(f"kanban: {exc}", file=sys.stderr)
         return 1
     print(f"Attached {name} to {args.task_id} (attachment {att_id}, {len(data)} bytes)")
+    return 0
+
+
+def _cmd_evidence(args: argparse.Namespace) -> int:
+    from hermes_cli.kanban_evidence import discover, recover, import_archive
+    with kb.connect_closing() as conn:
+        if kb.get_task(conn, args.task_id) is None:
+            raise ValueError('Task does not exist')
+        if args.import_archive:
+            result = import_archive(conn, args.task_id, args.import_archive)
+        elif getattr(args, 'register', None):
+            from hermes_cli.kanban_evidence import preserve
+            with kb.write_txn(conn):
+                result = preserve(conn, args.task_id, {'evidence_paths': args.register}, 'checkpoint')
+        elif args.recover:
+            result = recover(conn, args.task_id, args.manifest, args.recover)
+        else:
+            result = discover(conn, args.task_id)
+    print(json.dumps(result, indent=2))
     return 0
 
 

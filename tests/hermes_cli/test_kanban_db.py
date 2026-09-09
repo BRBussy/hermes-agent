@@ -579,9 +579,13 @@ def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_
 def test_complete_task_persists_scratch_artifacts_before_cleanup(kanban_home):
     """Completion artifacts from scratch workspaces survive workspace cleanup."""
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="render chart")
+        t = kb.create_task(conn, title="render chart", execution_authority="Isolated artifact regression")
         task = kb.get_task(conn, t)
         ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, t, ws)
+        disposable = ws.with_name("disposable-artifact-fixture")
+        ws.rename(disposable)
+        ws = disposable
         kb.set_workspace_path(conn, t, ws)
         artifact = ws / "chart.png"
         artifact.write_bytes(b"png-bytes")
@@ -600,16 +604,18 @@ def test_complete_task_persists_scratch_artifacts_before_cleanup(kanban_home):
     assert not ws.exists(), "scratch workspace should still be cleaned up"
     assert persisted.exists(), "artifact copy should survive scratch cleanup"
     assert persisted.parent == kb.task_attachments_dir(t)
-    assert persisted.name == "chart.png"
+    assert persisted.name.endswith("-chart.png")
     assert persisted.read_bytes() == b"png-bytes"
     assert str(persisted) != str(artifact)
     assert run is not None
     assert run.metadata["artifacts"] == [str(persisted)]
     with kb.connect() as conn:
         attachments = kb.list_attachments(conn, t)
-    assert [(a.filename, a.stored_path) for a in attachments] == [
-        ("chart.png", str(persisted.resolve()))
-    ]
+    from hermes_cli.kanban_evidence import discover
+    assert any(a.stored_path == str(persisted) for a in attachments)
+    with kb.connect() as conn:
+        receipts = discover(conn, t)
+    assert receipts and all(r['status'] == 'retained' for r in receipts)
 
 
 

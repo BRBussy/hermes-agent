@@ -300,9 +300,8 @@ def _relocate_imported_rows(
     Returns ``(stats, warnings)``. Three things move:
 
     * Attachment rows are repointed at this board's attachments tree.
-      Rows whose blob did not travel (an export made with
-      ``--no-attachments``) are dropped, because a row pointing at a file
-      that does not exist breaks download in every UI that lists it.
+      Required evidence rows retain missing-byte references for verification.
+      Ordinary attachment rows without transferred bytes are dropped.
     * Workspace paths are cleared. ``scratch`` tasks regenerate one under
       this board on the next claim, so they are simply reset. ``dir`` and
       ``worktree`` tasks cannot be resolved without a path that means
@@ -322,10 +321,10 @@ def _relocate_imported_rows(
         dropped = 0
         rehomed = 0
         for row in conn.execute(
-            "SELECT id, task_id, stored_path FROM task_attachments"
+            "SELECT id, task_id, stored_path, uploaded_by FROM task_attachments"
         ).fetchall():
             landed = attachments_dir / row["task_id"] / Path(row["stored_path"]).name
-            if landed.is_file():
+            if landed.is_file() or row["uploaded_by"] in {"retained-evidence", "evidence-manifest"}:
                 conn.execute(
                     "UPDATE task_attachments SET stored_path = ? WHERE id = ?",
                     (str(landed), row["id"]),
