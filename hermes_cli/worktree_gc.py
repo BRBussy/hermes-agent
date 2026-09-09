@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 import shutil
 import subprocess
 import time
@@ -49,8 +48,7 @@ logger = logging.getLogger(__name__)
 # Branches never considered for deletion, in any mode.
 _PROTECTED_BRANCHES = {"main", "master", "develop", "dev", "trunk"}
 
-# Trees owned by another lifecycle (kanban dispatcher gc) — never touched.
-_KANBAN_RE = re.compile(r"^t_[0-9a-f]+$")
+from hermes_cli.kanban_worktree import is_retained
 
 # Bounded cherry probe: a branch this far ahead of upstream is a stale-base
 # lane, not merged scratch; checking it is expensive and it stays preserved.
@@ -210,8 +208,8 @@ def audit_worktrees(repo_root: str, *, with_sizes: bool = True) -> List[TreeReco
                 untracked=untracked or [],
             ))
 
-        if _KANBAN_RE.match(entry.name):
-            rec("keep", "kanban task tree (owned by kanban gc)")
+        if is_retained(entry):
+            rec("keep", "retained Kanban task workspace")
             continue
 
         lock_state = _cli._worktree_lock_is_live(repo_root, str(entry), timeout=5)
@@ -281,6 +279,10 @@ def reclaim_worktrees(
     _REAP_VERDICTS = {"reap", "reap-archive", "reap-keep-branch"}
     for record in records:
         if record.verdict not in _REAP_VERDICTS:
+            continue
+        import cli as _cli
+        if is_retained(record.path) or _cli._worktree_lock_is_live(repo_root, record.path) == "live":
+            actions.append(f"kept {record.name} (retained or locked)")
             continue
         if dry_run:
             actions.append(f"would remove {record.name} ({record.reason})")

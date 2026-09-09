@@ -1018,6 +1018,12 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     if not d.exists():
         raise ValueError(f"board {normed!r} does not exist")
 
+    database = d / "kanban.db"
+    if database.exists():
+        with contextlib.closing(sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True)) as ownership:
+            if ownership.execute("SELECT 1 FROM tasks WHERE workspace_kind = 'worktree' LIMIT 1").fetchone():
+                raise ValueError("Board contains retained task ownership. Keep the board until explicit disposal")
+
     # If the user removed the currently-active board, revert to default.
     if get_current_board() == normed:
         clear_current_board()
@@ -5944,10 +5950,8 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     """Remove a task's scratch workspace dir and kill its stale tmux session.
 
     Called from :func:`complete_task` after the DB transaction commits.
-    Best-effort — any error is swallowed so cleanup never blocks task completion.
-    ``scratch`` workspaces are removed; ``worktree`` workspaces are removed only
-    when provably free of work (clean tree, every commit reachable from a
-    remote-tracking ref); ``dir`` workspaces are intentionally preserved.
+    Cleanup errors leave completion intact. Repository worktrees and directory
+    workspaces are retained throughout the card lifecycle.
     """
     try:
         row = conn.execute(
@@ -5982,9 +5986,6 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             )
             return
         if kind == "worktree":
-            # Kill the (dead) tmux worker session BEFORE removing the
-            # worktree so a lingering worker never has its cwd deleted out
-            # from under it. Both steps stay best-effort.
             _cleanup_worker_tmux(conn, task_id)
             _cleanup_worktree_workspace(task_id, path, row["branch_name"])
             _try_cleanup_parent_workspaces(conn, task_id)
@@ -5992,19 +5993,13 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         import shutil
         wp = Path(path)
         if wp.is_dir():
-            # Containment guard (#28818): a board's ``default_workdir`` can
-            # pair ``workspace_kind='scratch'`` with a user-supplied path
-            # pointing at a real source tree. Without this check, task
-            # completion would unconditionally ``shutil.rmtree`` that path
-            # and silently delete the user's source data.
-            if _is_managed_scratch_path(wp):
+            from hermes_cli.kanban_worktree import is_retained
+            if _is_managed_scratch_path(wp) and not is_retained(wp):
                 shutil.rmtree(wp, ignore_errors=True)
                 _log.debug("Removed scratch workspace: %s", wp)
             else:
                 _log.warning(
-                    "Refusing to remove out-of-scratch workspace for task %s: %s "
-                    "(workspace_kind='scratch' but path is outside any "
-                    "kanban-managed workspaces root)",
+                    "Retaining protected or out-of-scratch workspace for task %s: %s",
                     task_id, wp,
                 )
         # Also kill the tmux session for the worker that owned this task,
@@ -6021,64 +6016,8 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
 def _cleanup_worktree_workspace(
     task_id: str, path: str, branch_name: Optional[str] = None
 ) -> None:
-    """Remove a finished task's linked git worktree when it holds no work.
-
-    Mirrors the safety judgment of the CLI startup pruner
-    (``cli._prune_stale_worktrees``): removal requires a clean working tree
-    AND every commit reachable from a remote-tracking ref. Any doubt — dirty
-    files, unpushed commits, unresolvable repo, failing git — preserves the
-    worktree. The task's auto-generated ``wt/<task-id>`` branch is deleted
-    with it; custom branches are kept. Best-effort like the scratch path.
-    """
-    try:
-        from cli import _worktree_has_unpushed_commits, _worktree_is_dirty
-    except Exception:
-        return  # CLI safety predicates unavailable — preserve
-    try:
-        wp = Path(path).expanduser()
-        if not wp.is_dir():
-            return
-        common = _git_common_dir(wp)
-        if common is None or common.name != ".git":
-            return  # not a linked worktree of a normal repo — never guess
-        repo_root = common.parent
-        if wp.resolve(strict=False) == repo_root.resolve(strict=False):
-            return  # never remove the main checkout
-        if _worktree_is_dirty(str(wp)) or _worktree_has_unpushed_commits(str(wp)):
-            _log.info(
-                "Preserving worktree for task %s: dirty or unpushed work at %s",
-                task_id, wp,
-            )
-            return
-        # No --force: the dirty/unpushed checks above run before removal, so
-        # git's own dirty guard re-verifies at removal time. If the tree
-        # became dirty between our check and the removal (TOCTOU), removal
-        # fails safe and the worktree is preserved.
-        result = subprocess.run(
-            ["git", "-C", str(repo_root), "worktree", "remove", str(wp)],
-            capture_output=True,
-            text=True, encoding='utf-8', errors='replace',
-            timeout=60,
-            check=False,
-        )
-        if result.returncode != 0:
-            _log.warning(
-                "git worktree remove failed for task %s at %s: %s",
-                task_id, wp, (result.stderr or result.stdout or "").strip(),
-            )
-            return
-        _log.debug("Removed worktree workspace: %s", wp)
-        branch = (branch_name or "").strip() or f"wt/{task_id}"
-        if branch.startswith("wt/"):
-            subprocess.run(
-                ["git", "-C", str(repo_root), "branch", "-D", branch],
-                capture_output=True,
-                text=True, encoding='utf-8', errors='replace',
-                timeout=30,
-                check=False,
-            )
-    except Exception:
-        pass  # best-effort — never block completion
+    """Retain repository work independently of completion and publication state."""
+    _log.info("Retaining task %s worktree at %s", task_id, path)
 
 
 def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> None:
@@ -6115,7 +6054,6 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
             ).fetchone()
             if active:
                 continue  # still has active children
-            # All children done — safe to clean up parent workspace
             if row["workspace_kind"] == "worktree":
                 _cleanup_worktree_workspace(
                     parent_id, row["workspace_path"], row["branch_name"]
@@ -6123,7 +6061,8 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
                 continue
             import shutil
             wp = Path(row["workspace_path"])
-            if wp.is_dir() and _is_managed_scratch_path(wp):
+            from hermes_cli.kanban_worktree import is_retained
+            if wp.is_dir() and _is_managed_scratch_path(wp) and not is_retained(wp):
                 shutil.rmtree(wp, ignore_errors=True)
                 _log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
     except Exception:
@@ -7627,6 +7566,9 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     second deliberate action.
     """
     with write_txn(conn):
+        task = get_task(conn, task_id)
+        if task and task.workspace_kind == "worktree":
+            raise ValueError("Retained task ownership and review history require explicit disposal before deletion")
         row = conn.execute(
             "SELECT status FROM tasks WHERE id = ?",
             (task_id,),
@@ -7648,14 +7590,16 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
 def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Hard-delete a task and cascade to all related rows.
 
-    Because the schema does not use ``ON DELETE CASCADE`` foreign keys,
-    we explicitly delete from child tables first, then the task row.
-    This keeps the operation atomic (single ``write_txn``).
+    Retained worktree tasks require explicit disposal before their ownership
+    and review records can be removed.
 
     Returns ``True`` if the task existed and was deleted, ``False``
     if the task was not found.
     """
     with write_txn(conn):
+        task = get_task(conn, task_id)
+        if task and task.workspace_kind == "worktree":
+            raise ValueError("Retained task ownership and review history require explicit disposal before deletion")
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False
@@ -7867,6 +7811,10 @@ def _resolve_worktree_workspace(
     """Use the explicit path or board checkout as the task's worktree anchor."""
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", task.id):
         raise ValueError(f"Invalid worktree task identifier: {task.id!r}")
+    if task.repository_identity:
+        from hermes_cli.kanban_admission import validate_repository
+        validate_repository(task)
+        return Path(task.workspace_path), task.branch_name
     branch_name = task.branch_name or f"wt/{task.id}"
     if not task.workspace_path:
         board_slug = board if board else get_current_board()
@@ -7898,6 +7846,8 @@ def _resolve_worktree_workspace(
             raise ValueError(f"Worktree path is not a checkout root: {requested}")
         if actual_branch == branch_name:
             _ensure_git_worktree(requested, requested, branch_name)
+            from hermes_cli.kanban_worktree import retain
+            retain(task)
             return requested_resolved, actual_branch
         # Decomposed children can inherit another task's path.
         fallback_root = _repo_root_for_worktree_target(requested.parent)
@@ -11882,14 +11832,14 @@ def gc_events(
     conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3600,
 ) -> int:
     """Delete task_events rows older than ``older_than_seconds`` for tasks
-    in a terminal state (``done`` or ``archived``). Returns the number of
-    rows deleted. Running / ready / blocked tasks keep their full event
-    history."""
+    in a terminal state (``done`` or ``archived``). Retained worktree tasks
+    keep their event history. Returns the number of deleted rows."""
     cutoff = int(time.time()) - int(older_than_seconds)
     with write_txn(conn):
         cur = conn.execute(
             "DELETE FROM task_events WHERE created_at < ? AND task_id IN "
-            "(SELECT id FROM tasks WHERE status IN ('done', 'archived'))",
+            "(SELECT id FROM tasks WHERE status IN ('done', 'archived') "
+            "AND COALESCE(workspace_kind, '') != 'worktree')",
             (cutoff,),
         )
     return int(cur.rowcount or 0)

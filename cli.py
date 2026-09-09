@@ -1598,16 +1598,13 @@ def _path_is_within_root(path: Path, root: Path) -> bool:
 
 
 def _cleanup_failed_worktree_add(repo_root: str, wt_path: Path, branch_name: str) -> None:
-    """Make a failed/timed-out ``git worktree add`` atomic after the fact.
+    """Rollback partial session worktrees while preserving task and lock ownership."""
+    from hermes_cli.kanban_worktree import is_retained
+    if is_retained(wt_path) or _worktree_lock_is_live(
+        repo_root, str(wt_path), releasing_current_session=True
+    ) == "live":
+        return
 
-    ``git worktree add`` is not transactional: killed mid-checkout (the 30s
-    timeout) it leaves (a) the partially-materialized worktree directory,
-    (b) an admin entry under ``.git/worktrees/<name>`` that is LOCKED with a
-    reason naming the *current, live* pid — so the startup pruner's
-    dead-pid unlock will never touch it — and (c) sometimes the new branch.
-    Any retry of the same name then fails on the leftovers. Sweep all three,
-    quietly; every step is fail-soft because this runs on an error path.
-    """
     import shutil
     import subprocess
 
@@ -2473,23 +2470,12 @@ def _worktree_branch_pushed_exact(
         return False
 
 
-def _worktree_lock_is_live(repo_root: str, worktree_path: str, timeout: int = 10):
-    """Classify a worktree's git lock as live, dead, or absent.
+def _worktree_lock_is_live(repo_root: str, worktree_path: str, timeout: int = 10, *, releasing_current_session: bool = False):
+    """Classify session locks while preserving unrecognised owners.
 
-    ``hermes -w`` locks each worktree with reason ``hermes pid=<pid>`` so a
-    concurrent hermes process' startup prune leaves an in-use worktree alone.
-    But a *crashed* session leaves the lock behind forever, and
-    ``git worktree remove --force`` (single ``-f``) refuses to remove a locked
-    worktree — so dead-locked worktrees accumulate indefinitely. This lets the
-    pruner tell the two apart:
-
-    - ``"live"``  — locked and the owning pid is still running (skip it).
-    - ``"dead"``  — locked but the owning pid is gone, or the reason isn't a
-                    parseable hermes lock (safe to unlock + reap).
-    - ``None``    — not locked at all.
-
-    Fails SAFE toward ``"live"``: if git can't be queried at all we cannot
-    prove the worktree is safe to touch, so we report it as live.
+    Only a complete Hermes PID reason can expire. Session exit can treat its
+    own PID lock as absent by setting ``releasing_current_session``.
+    Unreadable lock state is treated as live.
     """
     import re
     import subprocess
@@ -2516,16 +2502,12 @@ def _worktree_lock_is_live(repo_root: str, worktree_path: str, timeout: int = 10
             if current != target:
                 continue
             reason = line[len("locked"):].strip()
-            m = re.search(r"hermes pid=(\d+)", reason)
+            m = re.fullmatch(r"hermes pid=(\d+)", reason)
             if not m:
-                # Locked by something we don't recognize as a hermes session
-                # (or lock reason unavailable). Treat as dead — a foreign lock
-                # on a hermes -w worktree is almost certainly a leftover, and
-                # the age/dirty/unpushed gates already ran before we got here.
-                return "dead"
+                return "live"
             pid = int(m.group(1))
             if pid == os.getpid():
-                return "live"
+                return None if releasing_current_session else "live"
             try:
                 from gateway.status import _pid_exists
                 return "live" if _pid_exists(pid) else "dead"
@@ -2536,13 +2518,7 @@ def _worktree_lock_is_live(repo_root: str, worktree_path: str, timeout: int = 10
 
 
 def _cleanup_worktree(info: Dict[str, str] = None) -> None:
-    """Remove a worktree and its branch on exit.
-
-    Preserves the worktree only if it has unpushed commits (real work
-    that hasn't been pushed to any remote).  Uncommitted changes alone
-    (untracked files, test artifacts) are not enough to keep it — agent
-    work lives in commits/PRs, not the working tree.
-    """
+    """Remove an eligible session worktree while preserving task and lock ownership."""
     global _active_worktree
     info = info or _active_worktree
     if not info:
@@ -2555,6 +2531,13 @@ def _cleanup_worktree(info: Dict[str, str] = None) -> None:
     repo_root = info["repo_root"]
 
     if not Path(wt_path).exists():
+        return
+
+    from hermes_cli.kanban_worktree import is_retained
+    if is_retained(wt_path) or _worktree_lock_is_live(
+        repo_root, wt_path, releasing_current_session=True
+    ) == "live":
+        _active_worktree = None
         return
 
     has_unpushed = _worktree_has_unpushed_commits(wt_path, timeout=10)
@@ -2784,16 +2767,14 @@ def _prune_stale_worktrees(repo_root: str, max_age_hours: int = 24) -> None:
     now = time.time()
     stale_work_cutoff = now - (7 * 24 * 3600)
     preserved_stale: list = []
-    # Kanban task worktrees (<repo>/.worktrees/t_<hex>) have their own
-    # dispatcher-driven lifecycle (hermes kanban gc) — never touch them here.
-    kanban_re = re.compile(r"^t_[0-9a-f]+$")
 
     # ── Phase 1: age filter (no subprocesses) ───────────────────────────────
     # Cheap stat-only pass so the thread pool below is sized to the trees that
     # actually need git work, not to everything on disk.
     candidates: list = []
     for entry in sorted(worktrees_dir.iterdir()):
-        if not entry.is_dir() or kanban_re.match(entry.name):
+        from hermes_cli.kanban_worktree import is_retained
+        if not entry.is_dir() or is_retained(entry):
             continue
 
         # Scratch trees (hermes-*) age out on the default schedule; named
@@ -2929,6 +2910,8 @@ def _prune_stale_worktrees(repo_root: str, max_age_hours: int = 24) -> None:
             logger.debug("Skipping live-locked worktree: %s", entry.name)
             continue
 
+        if is_retained(entry) or _worktree_lock_is_live(repo_root, str(entry), timeout=5) == "live":
+            continue
         if lock_state == "dead":
             try:
                 subprocess.run(

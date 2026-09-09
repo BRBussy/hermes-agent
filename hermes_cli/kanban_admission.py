@@ -32,6 +32,9 @@ def validate_repository(task):
         raise ValueError('Prepared repository identity differs from origin')
     subprocess.run(['git', '-C', str(path), 'merge-base', '--is-ancestor', task.approved_base, 'HEAD'],
                    check=True, capture_output=True, timeout=30)
+    names = _git(path, 'ls-files', '--cached', '--others', '--exclude-standard', '-z').split('\0')
+    if not any(name and (path / name).is_file() for name in names):
+        raise ValueError('Registered workspace contents are missing. Reconcile retained work before resuming')
 
 
 def rejection(task):
@@ -68,6 +71,8 @@ def authorise(conn, task_id, authority):
             raise ValueError('Reconcile the failed attempt before authorising recovery')
         if task.task_scope == 'repository' or task.workspace_kind == 'worktree' or task.project_id:
             validate_repository(task)
+            from hermes_cli.kanban_worktree import retain
+            retain(task)
         conn.execute('UPDATE tasks SET execution_authority = ? WHERE id = ?', (authority.strip(), task_id))
         kb._append_event(conn, task_id, 'execution_authorised', {'authority': authority.strip()})
     return kb.get_task(conn, task_id)
@@ -99,6 +104,8 @@ def prepare(conn, task_id, repository, repository_path, base, branch):
                     identity, base.lower(), branch, str(target)):
                 raise ValueError('Preparation conflicts with the recorded repository, base, branch or workspace')
             validate_repository(task)
+            from hermes_cli.kanban_worktree import retain
+            retain(task)
             return task
         if conn.execute('SELECT 1 FROM tasks WHERE id != ? AND (workspace_path = ? OR '
                         '(repository_identity = ? AND branch_name = ?))',
@@ -112,6 +119,8 @@ def prepare(conn, task_id, repository, repository_path, base, branch):
         task.approved_base = base.lower()
         task.review_required = True
         validate_repository(task)
+        from hermes_cli.kanban_worktree import retain
+        retain(task)
         conn.execute("UPDATE tasks SET task_scope = 'repository', repository_identity = ?, approved_base = ?, "
                      "workspace_kind = 'worktree', workspace_path = ?, branch_name = ?, review_required = 1, "
                      "execution_authority = NULL WHERE id = ?",

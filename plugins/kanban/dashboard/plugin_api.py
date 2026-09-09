@@ -1077,6 +1077,8 @@ def delete_task(task_id: str, board: Optional[str] = Query(None)):
         if not ok:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
         return {"deleted": True, "task_id": task_id}
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     finally:
         conn.close()
 
@@ -1223,6 +1225,7 @@ def _set_status_direct(
             ),
         )
         if reopening_satisfied_parent:
+            conn.execute("UPDATE tasks SET execution_authority = NULL WHERE id = ?", (task_id,))
             _invalidate_descendants_for_parent_reopen(
                 conn,
                 task_id,

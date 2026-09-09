@@ -137,7 +137,7 @@ class TestAuditVerdicts:
         records = worktree_gc.audit_worktrees(str(repo), with_sizes=False)
         record = _verdict(records, "t_deadbeef")
         assert record.verdict == "keep"
-        assert "kanban" in record.reason
+        assert "kanban" in record.reason.lower()
 
 
 class TestReclaim:

@@ -33,7 +33,7 @@ def repo(tmp_path, seed_repo):
 
 
 def task(repo, identifier='t_fixture', branch=None):
-    return SimpleNamespace(id=identifier, branch_name=branch, workspace_path=str(repo))
+    return SimpleNamespace(id=identifier, branch_name=branch, workspace_path=str(repo), repository_identity=None)
 
 
 def resolve_job(arguments):

@@ -16,6 +16,9 @@ def capture_state(task):
     This is a completion-time snapshot, not a filesystem lock against other
     processes changing files after completion.
     """
+    if task.repository_identity:
+        from hermes_cli.kanban_admission import validate_repository
+        validate_repository(task)
     root = Path(task.workspace_path or "").resolve(strict=True)
 
     def git(*args):

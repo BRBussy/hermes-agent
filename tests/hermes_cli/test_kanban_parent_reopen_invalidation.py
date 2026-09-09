@@ -34,10 +34,10 @@ def conn(tmp_path: Path):
 
 
 def _done_parent_with_done_child(conn):
-    parent_id = kb.create_task(conn, title="ancestor", assignee="planner")
+    parent_id = kb.create_task(conn, execution_authority="Isolated descendant retention regression", title="ancestor", assignee="planner")
     assert kb.complete_task(conn, parent_id)
     child_id = kb.create_task(
-        conn, title="child", assignee="builder", parents=[parent_id],
+        conn, execution_authority="Isolated descendant retention regression", title="child", assignee="builder", parents=[parent_id],
     )
     assert kb.complete_task(conn, child_id)
     return parent_id, child_id
@@ -55,7 +55,7 @@ def _reopen_parent_directly(conn, parent_id: str) -> None:
 def test_reopen_demotes_done_descendants_with_events_and_comments(conn):
     parent_id, child_id = _done_parent_with_done_child(conn)
     grandchild_id = kb.create_task(
-        conn, title="grandchild", assignee="writer", parents=[child_id],
+        conn, execution_authority="Isolated descendant retention regression", title="grandchild", assignee="writer", parents=[child_id],
     )
     assert kb.complete_task(conn, grandchild_id)
 
@@ -92,10 +92,10 @@ def test_reopen_demotes_done_descendants_with_events_and_comments(conn):
 def test_running_descendant_event_precedes_termination_via_reclaim_helper(
     conn, tmp_path, monkeypatch,
 ):
-    parent_id = kb.create_task(conn, title="ancestor", assignee="planner")
+    parent_id = kb.create_task(conn, execution_authority="Isolated descendant retention regression", title="ancestor", assignee="planner")
     assert kb.complete_task(conn, parent_id)
     child_id = kb.create_task(
-        conn, title="running child", assignee="builder", parents=[parent_id],
+        conn, execution_authority="Isolated descendant retention regression", title="running child", assignee="builder", parents=[parent_id],
     )
     claimed = kb.claim_task(conn, child_id)
     assert claimed is not None and claimed.status == "running"
@@ -177,10 +177,10 @@ def test_dashboard_and_db_paths_produce_identical_outcomes(tmp_path, monkeypatch
 
     def build_graph(tag: str):
         with kb.connect() as c:
-            parent = kb.create_task(c, title=f"{tag}-parent", assignee="planner")
+            parent = kb.create_task(c, execution_authority="Isolated descendant retention regression", title=f"{tag}-parent", assignee="planner")
             assert kb.complete_task(c, parent)
             child = kb.create_task(
-                c, title=f"{tag}-child", assignee="builder", parents=[parent],
+                c, execution_authority="Isolated descendant retention regression", title=f"{tag}-child", assignee="builder", parents=[parent],
             )
             assert kb.complete_task(c, child)
         return parent, child

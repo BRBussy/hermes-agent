@@ -2737,7 +2737,13 @@ def _cmd_archive(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         if purge_ids:
             for tid in purge_ids:
-                if not kb.delete_archived_task(conn, tid):
+                try:
+                    deleted = kb.delete_archived_task(conn, tid)
+                except ValueError as exc:
+                    failed.append(tid)
+                    print(f"cannot delete {tid}: {exc}", file=sys.stderr)
+                    continue
+                if not deleted:
                     failed.append(tid)
                     print(f"cannot delete {tid} (must already be archived)", file=sys.stderr)
                 else:
@@ -3379,16 +3385,6 @@ def _cmd_gc(args: argparse.Namespace) -> int:
             "WHERE status = 'archived'"
         ).fetchall()
     for row in rows:
-        if row["workspace_kind"] == "worktree":
-            # Backstop for worktrees that escaped the completion/archive hook
-            # (e.g. tasks archived before that hook existed). Same safety
-            # predicate: only clean, fully-pushed worktrees are removed.
-            wt_path = row["workspace_path"]
-            if wt_path and Path(wt_path).is_dir():
-                kb._cleanup_worktree_workspace(row["id"], wt_path, row["branch_name"])
-                if not Path(wt_path).is_dir():
-                    removed_ws += 1
-            continue
         if row["workspace_kind"] != "scratch":
             continue
         path = Path(row["workspace_path"] or (scratch_root / row["id"]))
@@ -3401,7 +3397,8 @@ def _cmd_gc(args: argparse.Namespace) -> int:
         except ValueError:
             # Safety: never delete outside the scratch root.
             continue
-        if path.exists() and path.is_dir():
+        from hermes_cli.kanban_worktree import is_retained
+        if path.exists() and path.is_dir() and not is_retained(path):
             shutil.rmtree(path, ignore_errors=True)
             removed_ws += 1
 

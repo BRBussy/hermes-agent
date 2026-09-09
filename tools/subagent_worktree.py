@@ -318,7 +318,8 @@ def finalize_subagent_worktree(
             "; ".join(failed), unmeasured="/".join(unmeasured)
         )
 
-    if prune and payload["commits"] == 0 and not payload["dirty"]:
+    from hermes_cli.kanban_worktree import is_retained
+    if prune and payload["commits"] == 0 and not payload["dirty"] and not is_retained(path):
         try:
             removed = _run_git(
                 ["worktree", "remove", "--force", path], cwd=repo_root or path
