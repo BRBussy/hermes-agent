@@ -7,13 +7,15 @@ from hermes_cli import kanban_db as kb
 
 @pytest.mark.parametrize("lane", ["ready", "review"])
 def test_dispatch_passes_recorded_workspace_to_spawn(monkeypatch, tmp_path, lane):
+    from hermes_cli import kanban_admission
+    monkeypatch.setattr(kanban_admission, "validate_repository", lambda task: None)
     home = tmp_path / "profile"
     (home / "profiles/worker").mkdir(parents=True)
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
     conn = kb.connect()
-    task_id = kb.create_task(conn, title="Workspace context", assignee="worker",
+    task_id = kb.create_task(conn, execution_authority="Isolated regression fixture", title="Workspace context", assignee="worker",
                              workspace_kind="worktree", workspace_path=str(tmp_path / "anchor"))
     if lane == "review":
         with kb.write_txn(conn):

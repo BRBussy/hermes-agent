@@ -654,6 +654,12 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         if not isinstance(note, dict):
             return
         method = note.get("method") or ""
+        if method in {'item/started', 'item/completed', 'item/agentMessage/delta',
+                      'item/reasoning/delta', 'item/reasoning/summaryDelta',
+                      'item/commandExecution/outputDelta', 'turn/started', 'turn/completed'}:
+            touch = getattr(agent, '_touch_activity', None)
+            if callable(touch):
+                touch('Codex runtime activity')
         params = note.get("params") or {}
         if not isinstance(params, dict):
             params = {}

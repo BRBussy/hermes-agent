@@ -66,6 +66,10 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "priority": t.priority,
         "tenant": t.tenant,
         "review_required": t.review_required,
+        "task_scope": t.task_scope,
+        "execution_authority": t.execution_authority,
+        "repository_identity": t.repository_identity,
+        "approved_base": t.approved_base,
         "workspace_kind": t.workspace_kind,
         "workspace_path": t.workspace_path,
         "branch_name": t.branch_name,
@@ -409,6 +413,19 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "two retries. Omit to use the dispatcher's "
                                "kanban.failure_limit config "
                                f"(default {kb.DEFAULT_FAILURE_LIMIT}).")
+    p_create.add_argument("--task-scope", choices=['scratch', 'repository'])
+    p_create.add_argument("--execution-authority", help="Task-specific approval reference")
+    p_prepare = sub.add_parser('prepare', help='Prepare an inactive repository card')
+    p_prepare.add_argument('task_id')
+    p_prepare.add_argument('--repository', required=True)
+    p_prepare.add_argument('--repository-path', required=True)
+    p_prepare.add_argument('--base', required=True)
+    p_prepare.add_argument('--branch', required=True)
+    p_recover = sub.add_parser('recover', help='Reconcile retained work and publication receipts')
+    p_recover.add_argument('task_id')
+    p_authorise = sub.add_parser('authorise', help='Record task-specific execution authority')
+    p_authorise.add_argument('task_id')
+    p_authorise.add_argument('--authority', required=True)
     p_create.add_argument("--review-required", action="store_true")
     p_create.add_argument("--model", default=None, dest="model_override",
                           help="Pin the worker to this model (passed as "
@@ -1148,6 +1165,9 @@ def kanban_command(args: argparse.Namespace) -> int:
         handlers = {
             "init":     _cmd_init,
             "create":   _cmd_create,
+            "prepare": _cmd_prepare,
+            "authorise": _cmd_authorise,
+            "recover": _cmd_recover,
             "swarm":    _cmd_swarm,
             "list":     _cmd_list,
             "ls":       _cmd_list,
@@ -1222,6 +1242,9 @@ def _profile_author() -> str:
 
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "init",
+    "prepare",
+    "authorise",
+    "recover",
     "create",
     "swarm",
     "assign",
@@ -1641,6 +1664,29 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_recover(args):
+    from hermes_cli.kanban_recovery import reconcile
+    with kb.connect_closing() as conn:
+        print(json.dumps(reconcile(conn, args.task_id), indent=2))
+    return 0
+
+
+def _cmd_prepare(args):
+    from hermes_cli.kanban_admission import prepare
+    with kb.connect_closing() as conn:
+        task = prepare(conn, args.task_id, args.repository, args.repository_path, args.base, args.branch)
+        print(json.dumps(_task_to_dict(task), indent=2))
+    return 0
+
+
+def _cmd_authorise(args):
+    from hermes_cli.kanban_admission import authorise
+    with kb.connect_closing() as conn:
+        task = authorise(conn, args.task_id, args.authority)
+        print(json.dumps(_task_to_dict(task), indent=2))
+    return 0
+
+
 def _cmd_create(args: argparse.Namespace) -> int:
     try:
         ws_kind, ws_path = _parse_workspace_flag(args.workspace)
@@ -1668,6 +1714,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
         task_id = kb.create_task(
             conn,
             title=args.title,
+            task_scope=getattr(args, "task_scope", None),
+            execution_authority=getattr(args, "execution_authority", None),
             body=args.body,
             assignee=args.assignee,
             created_by=args.created_by or _profile_author(),
@@ -1805,6 +1853,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
         parents = kb.parent_ids(conn, args.task_id)
         children = kb.child_ids(conn, args.task_id)
         runs = kb.list_runs(conn, args.task_id, **rsk)
+        from hermes_cli.kanban_recovery import diagnostics
+        attempt_diagnostics = diagnostics(conn, args.task_id)
         # Workers hand off via ``task_runs.summary``; ``tasks.result`` is left NULL unless the caller explicitly passed
         # ``result=``. Surfacing the latest summary here keeps ``show`` from
         # looking like a no-op when the worker actually did real work.
@@ -1816,6 +1866,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
         payload = {
             "task": _task_to_dict(task),
             "latest_summary": latest_summary,
+            "attempts": attempt_diagnostics,
             "parents": parents,
             "children": children,
             "comments": [

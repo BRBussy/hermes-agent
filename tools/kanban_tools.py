@@ -494,6 +494,10 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "priority": task.priority,
         "tenant": task.tenant,
         "review_required": task.review_required,
+        "task_scope": task.task_scope,
+        "execution_authority": task.execution_authority,
+        "repository_identity": task.repository_identity,
+        "approved_base": task.approved_base,
         "workspace_kind": task.workspace_kind,
         "workspace_path": task.workspace_path,
         "project_id": task.project_id,
@@ -1446,6 +1450,8 @@ def _handle_create(args: dict, **kw) -> str:
             new_tid = kb.create_task(
                 conn,
                 title=str(title).strip(),
+                task_scope=args.get("task_scope"),
+                execution_authority=args.get("execution_authority"),
                 body=body,
                 assignee=str(assignee),
                 parents=tuple(parents),
@@ -2149,12 +2155,14 @@ KANBAN_CREATE_SCHEMA = {
         "one (pass the current task id in ``parents``). Used by "
         "orchestrator workers to fan out — decompose work into child "
         "tasks with specific assignees, link them into a pipeline, "
-        "then complete your own task. The dispatcher picks up the new "
-        "tasks on its next tick and spawns the assigned profiles."
+        "then complete your own task. Dispatch requires explicit task-specific "
+        "execution authority and repository preparation for repository work."
     ),
     "parameters": {
         "type": "object",
         "properties": {
+            "task_scope": {"type": "string", "enum": ["scratch", "repository"]},
+            "execution_authority": {"type": "string", "description": "Task-specific operator approval. Workers cannot grant it."},
             "title": {
                 "type": "string",
                 "description": "Short task title (required).",

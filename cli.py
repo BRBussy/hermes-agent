@@ -22011,6 +22011,15 @@ def main(
         # agent must wait the full MCP cold-start bound before its first
         # (and only) tool snapshot. See #51316.
         cli._single_query_mode = True
+        if os.environ.get("HERMES_KANBAN_RUN_ID"):
+            import contextlib
+            from hermes_cli import kanban_db as _startup_kb
+            with contextlib.closing(_startup_kb.connect()) as _startup_conn:
+                _startup_kb.acknowledge_worker(
+                    _startup_conn, os.environ["HERMES_KANBAN_TASK"],
+                    int(os.environ["HERMES_KANBAN_RUN_ID"]),
+                    os.environ["HERMES_KANBAN_CLAIM_LOCK"],
+                )
         # Mark single-query for the approval gate. cli.py sets
         # HERMES_INTERACTIVE earlier for interactive sudo prompts, but a -q
         # run has NO user waiting to answer approval prompts. The gate reads

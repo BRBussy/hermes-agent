@@ -339,6 +339,14 @@ class CodexAppServerClient:
             with self._stderr_lock:
                 self._stderr_lines.append(f"<stdout reader error> {exc}")
 
+        finally:
+            if not self._closed:
+                try:
+                    from hermes_cli.kanban_recovery import record_transport_loss
+                    record_transport_loss()
+                except Exception:
+                    pass
+
     def _dispatch(self, msg: dict) -> None:
         # Reply (has id + result/error, no method)
         if "id" in msg and ("result" in msg or "error" in msg):

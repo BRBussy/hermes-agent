@@ -547,6 +547,7 @@ def get_task(
         # Drawer/detail view returns the FULL summary (no truncation) so
         # operators can read the complete worker handoff without making
         # a second round-trip. Cards on /board carry a 200-char preview.
+        from hermes_cli.kanban_recovery import diagnostics
         full_summary = kanban_db.latest_summary(conn, task_id)
         task_d = _task_dict(task, latest_summary=full_summary)
         links = _links_for(conn, task_id)
@@ -578,6 +579,7 @@ def get_task(
             "attachments": [_attachment_dict(a) for a in kanban_db.list_attachments(conn, task_id)],
             "links": links,
             "child_results": child_results,
+            "attempts": diagnostics(conn, task_id),
             "runs": [
                 _run_dict(r)
                 for r in kanban_db.list_runs(
@@ -597,6 +599,8 @@ def get_task(
 # ---------------------------------------------------------------------------
 
 class CreateTaskBody(BaseModel):
+    task_scope: Optional[str] = None
+    execution_authority: Optional[str] = None
     review_required: bool = False
     title: str
     body: Optional[str] = None
@@ -631,6 +635,8 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             conn,
             review_required=payload.review_required,
             title=payload.title,
+            task_scope=payload.task_scope,
+            execution_authority=payload.execution_authority,
             body=payload.body,
             assignee=payload.assignee,
             created_by="dashboard",
@@ -1223,7 +1229,7 @@ def _set_status_direct(
                 terminations,
             )
     for pid, claim_lock in terminations:
-        kanban_db._terminate_reclaimed_worker(pid, claim_lock)
+        kanban_db._terminate_reclaimed_worker(pid, claim_lock, conn=conn)
     # If we re-opened something, children may have gone stale.
     if effective_status in {"done", "ready", "review"}:
         kanban_db.recompute_ready(conn)
@@ -2291,7 +2297,8 @@ def dispatch(
     conn = _conn(board=board)
     try:
         result = kanban_db.dispatch_once(
-            conn, dry_run=dry_run, max_spawn=max_n, board=board,
+            conn,
+                    durable_owner=True, dry_run=dry_run, max_spawn=max_n, board=board,
         )
         # DispatchResult is a dataclass.
         try:

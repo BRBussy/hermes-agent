@@ -15,6 +15,8 @@ def git(path, *args):
 @pytest.fixture(scope='session')
 def seed_repo(tmp_path_factory):
     source = Path(kb.__file__).resolve().parents[1]
+    if not (source / ".git").exists():
+        source = (source / "venv").resolve().parent
     revision = git(source, 'rev-list', '--max-parents=0', 'HEAD').splitlines()[0]
     seed = tmp_path_factory.mktemp('worktree-seed')
     git(seed, 'init')

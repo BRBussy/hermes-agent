@@ -46,7 +46,7 @@ def _claimed_review(
 ):
     task_id = kb.create_task(
         conn,
-        title=title,
+        execution_authority="Isolated regression fixture", title=title,
         assignee="builder",
         max_runtime_seconds=max_runtime_seconds,
     )
@@ -69,7 +69,7 @@ def _claimed_review(
 
 
 def test_same_card_review_supports_changes_and_approval_without_block_loop(conn):
-    task_id = kb.create_task(conn, title="Implement guarded export", assignee="builder")
+    task_id = kb.create_task(conn, execution_authority="Isolated regression fixture", title="Implement guarded export", assignee="builder")
     implementation = kb.claim_task(conn, task_id, claimer="builder:1")
     assert implementation is not None
 
@@ -204,10 +204,10 @@ def test_rereview_requires_explicit_reviewer_when_provenance_is_invalid(
 
 
 def test_review_changes_reapply_parent_gate(conn):
-    parent_id = kb.create_task(conn, title="Upstream prerequisite", assignee="planner")
+    parent_id = kb.create_task(conn, execution_authority="Isolated regression fixture", title="Upstream prerequisite", assignee="planner")
     task_id = kb.create_task(
         conn,
-        title="Dependent implementation",
+        execution_authority="Isolated regression fixture", title="Dependent implementation",
         assignee="builder",
         parents=[parent_id],
     )
@@ -241,11 +241,11 @@ def test_review_changes_reapply_parent_gate(conn):
 
 
 def test_parent_reopen_blocks_request_review_until_parent_is_done(conn) -> None:
-    parent_id = kb.create_task(conn, title="Parent", assignee="planner")
+    parent_id = kb.create_task(conn, execution_authority="Isolated regression fixture", title="Parent", assignee="planner")
     assert kb.complete_task(conn, parent_id)
     task_id = kb.create_task(
         conn,
-        title="Implementation with reopened parent",
+        execution_authority="Isolated regression fixture", title="Implementation with reopened parent",
         assignee="builder",
         parents=[parent_id],
     )
@@ -276,7 +276,7 @@ def test_request_changes_fails_closed_on_malformed_review_provenance(
     conn,
     bad_payload: str,
 ):
-    task_id = kb.create_task(conn, title="Malformed handoff", assignee="builder")
+    task_id = kb.create_task(conn, execution_authority="Isolated regression fixture", title="Malformed handoff", assignee="builder")
     implementation = kb.claim_task(conn, task_id, claimer="builder:1")
     assert implementation is not None
     assert kb.request_review(
@@ -347,6 +347,9 @@ def test_interrupted_review_runs_retry_in_review_phase(
             failure_limit=3,
         )
     elif reclaim_kind == "expired_claim":
+        from tests.hermes_cli.test_kanban_worker_identity import spawn, stop
+        proc = spawn(conn, review)
+        stop(proc)
         with kb.write_txn(conn):
             conn.execute(
                 "UPDATE tasks SET claim_expires = ? WHERE id = ?",
@@ -367,7 +370,15 @@ def test_interrupted_review_runs_retry_in_review_phase(
                 "UPDATE task_runs SET started_at = ? WHERE id = ?",
                 (old, review.current_run_id),
             )
-        assert kb.detect_stale_running(conn, stale_timeout_seconds=1) == [task_id]
+        from tests.hermes_cli.test_kanban_worker_identity import spawn, stop
+        proc = spawn(conn, review)
+        try:
+            assert kb.detect_stale_running(conn, stale_timeout_seconds=1) == []
+            assert kb.get_task(conn, task_id).status == 'running'
+            assert proc.poll() is None
+        finally:
+            stop(proc)
+        return
 
     retried = kb.get_task(conn, task_id)
     assert retried is not None
@@ -417,11 +428,11 @@ def test_review_escalation_unblocks_back_to_review(conn) -> None:
 
 
 def test_review_dependency_wait_reenters_review_after_parent_finishes(conn) -> None:
-    parent_id = kb.create_task(conn, title="Parent", assignee="planner")
+    parent_id = kb.create_task(conn, execution_authority="Isolated regression fixture", title="Parent", assignee="planner")
     assert kb.complete_task(conn, parent_id)
     task_id = kb.create_task(
         conn,
-        title="Review after dependency refresh",
+        execution_authority="Isolated regression fixture", title="Review after dependency refresh",
         assignee="builder",
         parents=[parent_id],
     )
@@ -454,51 +465,30 @@ def test_review_dependency_wait_reenters_review_after_parent_finishes(conn) -> N
     assert resumed.status == "review"
 
 
-def test_crashed_and_timed_out_review_runs_retry_in_review_phase(
-    conn,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
-    monkeypatch.setattr(kb, "_classify_worker_exit", lambda _pid: ("nonzero_exit", 1))
-    old = int(time.time()) - 1_000
-
-    timed_out_id, timed_out_run = _claimed_review(
-        conn,
-        "Timeout during review",
-        max_runtime_seconds=1,
-    )
-    with kb.write_txn(conn):
-        conn.execute(
-            "UPDATE tasks SET worker_pid = ?, started_at = ? WHERE id = ?",
-            (999_998, old, timed_out_id),
-        )
-        conn.execute(
-            "UPDATE task_runs SET worker_pid = ?, started_at = ? WHERE id = ?",
-            (999_998, old, timed_out_run.current_run_id),
-        )
-    assert timed_out_id in kb.enforce_max_runtime(conn, signal_fn=lambda *_: None)
-    timed_out = kb.get_task(conn, timed_out_id)
-    assert timed_out is not None
-    assert timed_out.status == "review"
-
+def test_crashed_and_timed_out_review_runs_retry_in_review_phase(conn):
+    from tests.hermes_cli.test_kanban_worker_identity import spawn, stop
+    elapsed_start = int(time.time()) - 1_000
+    timed_out_id, timed_out_run = _claimed_review(conn, "Timeout during review", max_runtime_seconds=1)
+    proc = spawn(conn, timed_out_run)
+    try:
+        with kb.write_txn(conn):
+            conn.execute('UPDATE task_runs SET started_at = ? WHERE id = ?', (elapsed_start, timed_out_run.current_run_id))
+        assert timed_out_id in kb.enforce_max_runtime(conn)
+        assert kb.get_task(conn, timed_out_id).status == 'review'
+    finally:
+        stop(proc)
     crashed_id, crashed_run = _claimed_review(conn, "Crash during review")
+    proc = spawn(conn, crashed_run)
+    stop(proc)
+    kb._observe_worker_exit(proc, conn.execute('PRAGMA database_list').fetchone()[2], crashed_run.current_run_id)
     with kb.write_txn(conn):
-        conn.execute(
-            "UPDATE tasks SET worker_pid = ?, started_at = ? WHERE id = ?",
-            (999_999, old, crashed_id),
-        )
-        conn.execute(
-            "UPDATE task_runs SET worker_pid = ?, started_at = ? WHERE id = ?",
-            (999_999, old, crashed_run.current_run_id),
-        )
+        conn.execute('UPDATE tasks SET started_at = ? WHERE id = ?', (elapsed_start, crashed_id))
     assert crashed_id in kb.detect_crashed_workers(conn)
-    crashed = kb.get_task(conn, crashed_id)
-    assert crashed is not None
-    assert crashed.status == "review"
+    assert kb.get_task(conn, crashed_id).status == 'review'
 
 
 def test_goal_run_status_is_bound_to_original_run(conn) -> None:
-    task_id = kb.create_task(conn, title="Goal handoff race", assignee="builder")
+    task_id = kb.create_task(conn, execution_authority="Isolated regression fixture", title="Goal handoff race", assignee="builder")
     implementation = kb.claim_task(conn, task_id)
     assert implementation is not None
     assert kb.request_review(
@@ -541,7 +531,7 @@ def test_goal_run_status_is_bound_to_original_run(conn) -> None:
 
 
 def test_parked_review_approval_without_evidence_still_creates_audit_run(conn) -> None:
-    task_id = kb.create_task(conn, title="Manual approval", assignee="reviewer")
+    task_id = kb.create_task(conn, execution_authority="Isolated regression fixture", title="Manual approval", assignee="reviewer")
     assert kb.request_review(conn, task_id, summary="implementation handoff")
     assert kb.complete_task(conn, task_id)
     completed_event = _event(kb.list_events(conn, task_id), "completed")
@@ -561,12 +551,12 @@ def test_parked_review_approval_without_evidence_still_creates_audit_run(conn) -
 def test_legacy_review_child_deadlock_is_reported_immediately(conn):
     implementation_id = kb.create_task(
         conn,
-        title="Implement export",
+        execution_authority="Isolated regression fixture", title="Implement export",
         assignee="builder",
     )
     reviewer_id = kb.create_task(
         conn,
-        title="Review export",
+        execution_authority="Isolated regression fixture", title="Review export",
         assignee="reviewer",
         parents=[implementation_id],
     )
@@ -610,11 +600,11 @@ def test_legacy_review_child_deadlock_is_reported_immediately(conn):
 
 def test_hard_block_with_waiting_child_is_not_mislabeled_as_review_deadlock(conn):
     implementation_id = kb.create_task(
-        conn, title="Implement export", assignee="builder"
+        conn, execution_authority="Isolated regression fixture", title="Implement export", assignee="builder"
     )
     child_id = kb.create_task(
         conn,
-        title="Publish export",
+        execution_authority="Isolated regression fixture", title="Publish export",
         assignee="release",
         parents=[implementation_id],
     )
@@ -653,7 +643,7 @@ def test_review_transitions_preserve_consecutive_failures(conn) -> None:
     a crash after request_changes increments it to 2 and trips a
     failure_limit=2 breaker. Only complete_task's success path resets it.
     """
-    task_id = kb.create_task(conn, title="flaky feature", assignee="builder")
+    task_id = kb.create_task(conn, execution_authority="Isolated regression fixture", title="flaky feature", assignee="builder")
     with kb.write_txn(conn):
         conn.execute(
             "UPDATE tasks SET consecutive_failures = 1 WHERE id = ?",
@@ -699,7 +689,7 @@ def test_review_transitions_preserve_consecutive_failures(conn) -> None:
     assert kb.get_task(conn, task_id).status == "blocked"
 
     # Sanity: complete_task's success path still clears the counter.
-    ok_id = kb.create_task(conn, title="healthy", assignee="builder")
+    ok_id = kb.create_task(conn, execution_authority="Isolated regression fixture", title="healthy", assignee="builder")
     with kb.write_txn(conn):
         conn.execute(
             "UPDATE tasks SET consecutive_failures = 1 WHERE id = ?",

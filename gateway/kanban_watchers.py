@@ -263,7 +263,7 @@ class GatewayKanbanWatchersMixin:
         # but is not a block (see kanban_db.request_review); the task is not
         # archived, so the subscription stays alive and later review
         # cycles keep notifying.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
+        TERMINAL_KINDS = ("progress_warning", "recovery_required", "completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
         # so removing its subscription would silence a later reopen. We used
@@ -607,6 +607,11 @@ class GatewayKanbanWatchersMixin:
                             if ev.payload and ev.payload.get("reason"):
                                 reason = f": {str(ev.payload['reason'])[:160]}"
                             msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
+                        elif kind == "progress_warning":
+                            quiet = (ev.payload or {}).get('quiet_seconds', '?')
+                            msg = f"Kanban {sub['task_id']} has a verified live worker with no recorded runtime activity for {quiet}s. Inspect the attempt before recovery."
+                        elif kind == "recovery_required":
+                            msg = f"Kanban {sub['task_id']} stopped. Its worktree is retained. Reconcile publication receipts before authorising recovery."
                         elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):
@@ -618,7 +623,7 @@ class GatewayKanbanWatchersMixin:
                         elif kind == "crashed":
                             msg = (
                                 f"✖ {board_tag}{tag}Kanban {sub['task_id']} worker crashed "
-                                f"(pid gone); dispatcher will retry"
+                                f"(process exit detected). Inspect the attempt and recovery requirements."
                             )
                         elif kind == "timed_out":
                             limit = 0
@@ -626,7 +631,7 @@ class GatewayKanbanWatchersMixin:
                                 limit = int(ev.payload["limit_seconds"])
                             msg = (
                                 f"⏱ {board_tag}{tag}Kanban {sub['task_id']} timed out "
-                                f"(max_runtime={limit}s); will retry"
+                                f"(max_runtime={limit}s). Inspect the attempt and recovery requirements."
                             )
                         elif kind == "status":
                             new_status = ""
@@ -1565,6 +1570,7 @@ class GatewayKanbanWatchersMixin:
                 # `_kanban_notifier_watcher` and issue #21378.
                 return _kb.dispatch_once(
                     conn,
+                    durable_owner=True,
                     board=slug,
                     max_spawn=max_spawn,
                     max_in_progress=max_in_progress,

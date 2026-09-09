@@ -76,7 +76,7 @@ def _last_run(conn, tid):
 
 def test_request_review_transitions_running_to_review(kanban_home: Path) -> None:
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="impl a feature", assignee="worker")
+        tid = kb.create_task(conn, execution_authority="Isolated regression fixture", title="impl a feature", assignee="worker")
         kb.claim_task(conn, tid)
         run_id = kb.get_task(conn, tid).current_run_id
         assert run_id is not None
@@ -126,7 +126,7 @@ def test_repeated_review_requests_never_triage(kanban_home: Path) -> None:
     ``block_recurrences >= 2`` and was wrongly routed to ``triage`` with a
     ``block_loop_detected`` event. ``request_review`` must never do that."""
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="cycle me", assignee="worker")
+        tid = kb.create_task(conn, execution_authority="Isolated regression fixture", title="cycle me", assignee="worker")
 
         for _ in range(4):
             # Executor claims (ready->running or review->running) and finishes
@@ -163,7 +163,7 @@ def test_repeated_review_requests_never_triage(kanban_home: Path) -> None:
 
 def test_request_review_expected_run_id_mismatch_is_noop(kanban_home: Path) -> None:
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="stale worker", assignee="worker")
+        tid = kb.create_task(conn, execution_authority="Isolated regression fixture", title="stale worker", assignee="worker")
         kb.claim_task(conn, tid)
         real_run = kb.get_task(conn, tid).current_run_id
 
@@ -193,7 +193,7 @@ def test_request_review_refuses_to_clear_live_claim_without_ownership(
     (``expected_run_id=<own run>``) both still work.
     """
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="live claim", assignee="worker")
+        tid = kb.create_task(conn, execution_authority="Isolated regression fixture", title="live claim", assignee="worker")
         claimed = kb.claim_task(conn, tid)
         assert claimed is not None
 
@@ -218,7 +218,7 @@ def test_request_review_refuses_to_clear_live_claim_without_ownership(
 
     # 3) force=True: explicit human override on a fresh live-claimed task.
     with kb.connect() as conn:
-        tid2 = kb.create_task(conn, title="forced", assignee="worker")
+        tid2 = kb.create_task(conn, execution_authority="Isolated regression fixture", title="forced", assignee="worker")
         assert kb.claim_task(conn, tid2) is not None
         assert kb.request_review(conn, tid2, summary="override", force=True) is True
         assert kb.get_task(conn, tid2).status == "review"
@@ -230,7 +230,7 @@ def test_request_review_malformed_provenance_gets_distinct_reason(
     """M1 regression: malformed re-review provenance is a named failure, not
     the generic 'unknown id or not in running/ready'."""
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="provenance", assignee="builder")
+        tid = kb.create_task(conn, execution_authority="Isolated regression fixture", title="provenance", assignee="builder")
         claimed = kb.claim_task(conn, tid)
         assert kb.request_review(
             conn, tid, summary="v1", reviewer="reviewer",
@@ -280,7 +280,7 @@ def test_request_review_whitespace_only_summary_does_not_crash(
     carry ``summary=None`` (whitespace collapses to no summary).
     """
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="blank summary", assignee="worker")
+        tid = kb.create_task(conn, execution_authority="Isolated regression fixture", title="blank summary", assignee="worker")
         kb.claim_task(conn, tid)
         run_id = kb.get_task(conn, tid).current_run_id
 
@@ -304,7 +304,7 @@ def test_complete_task_closes_review_to_done(kanban_home: Path) -> None:
     closed it, so ``current_run_id IS NULL``, the #54823 shape) must be
     completable by a human approval via ``complete_task``."""
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="approve me", assignee="worker")
+        tid = kb.create_task(conn, execution_authority="Isolated regression fixture", title="approve me", assignee="worker")
         kb.claim_task(conn, tid)
         kb.request_review(
             conn, tid, summary="ready",
@@ -333,7 +333,7 @@ def test_review_requested_event_is_claimable_for_wake(kanban_home: Path) -> None
     subscription is NOT torn down (task is in ``review``, not done/archived),
     so later review cycles keep notifying."""
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="wake me", assignee="worker")
+        tid = kb.create_task(conn, execution_authority="Isolated regression fixture", title="wake me", assignee="worker")
         kb.add_notify_sub(
             conn,
             task_id=tid,
@@ -383,7 +383,7 @@ def test_review_dispatch_gate_prevents_phantom_reviewer(
     import hermes_cli.profiles as profmod
 
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="park", assignee="worker")
+        tid = kb.create_task(conn, execution_authority="Isolated regression fixture", title="park", assignee="worker")
         kb.claim_task(conn, tid)
         kb.request_review(
             conn, tid, summary="done",
@@ -437,7 +437,7 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
 
     with kb.connect() as conn:
         # Review-lane task with a fresh PR comment.
-        review_id = kb.create_task(conn, title="review me", assignee="reviewer")
+        review_id = kb.create_task(conn, execution_authority="Isolated regression fixture", title="review me", assignee="reviewer")
         claimed = kb.claim_task(conn, review_id)
         assert claimed is not None
         kb.add_comment(conn, review_id, author="worker", body=pr_comment)
@@ -446,7 +446,7 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
             expected_run_id=claimed.current_run_id,
         )
         # Ready-lane task with the same fresh PR comment.
-        ready_id = kb.create_task(conn, title="already PRed", assignee="worker")
+        ready_id = kb.create_task(conn, execution_authority="Isolated regression fixture", title="already PRed", assignee="worker")
         kb.add_comment(conn, ready_id, author="worker", body=pr_comment)
 
         assert kb.check_respawn_guard(conn, ready_id) == "active_pr"
@@ -496,7 +496,7 @@ def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
     with kb.connect() as conn:
         task_id = kb.create_task(
             conn,
-            title="domain review",
+            execution_authority="Isolated regression fixture", title="domain review",
             assignee="reviewer",
             skills=["domain-specific-review"],
         )
@@ -542,13 +542,13 @@ def test_review_dispatch_honors_global_and_per_profile_caps(
     )
 
     with kb.connect() as conn:
-        running_id = kb.create_task(conn, title="already running", assignee="builder")
+        running_id = kb.create_task(conn, execution_authority="Isolated regression fixture", title="already running", assignee="builder")
         running = kb.claim_task(conn, running_id)
         assert running is not None
 
         review_ids: list[str] = []
         for title in ("review one", "review two"):
-            task_id = kb.create_task(conn, title=title, assignee="reviewer")
+            task_id = kb.create_task(conn, execution_authority="Isolated regression fixture", title=title, assignee="reviewer")
             implementation = kb.claim_task(conn, task_id)
             assert implementation is not None
             assert kb.request_review(
@@ -606,7 +606,7 @@ def test_reopen_review_task_returns_to_ready(kanban_home: Path) -> None:
     goes back to ``ready`` so the dispatcher re-runs the implementer. It must
     NOT touch ``block_recurrences`` (review was never a block)."""
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="reopen me", assignee="worker")
+        tid = kb.create_task(conn, execution_authority="Isolated regression fixture", title="reopen me", assignee="worker")
         kb.claim_task(conn, tid)
         kb.request_review(
             conn, tid, summary="v1", reviewer="reviewer",
@@ -637,7 +637,7 @@ def test_review_cycle_end_to_end(kanban_home: Path) -> None:
     approve -> done. Never blocks, never triages, and stays wake-subscribed
     until done."""
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="cycle", assignee="worker")
+        tid = kb.create_task(conn, execution_authority="Isolated regression fixture", title="cycle", assignee="worker")
 
         # Pass 1: implement -> review.
         kb.claim_task(conn, tid)
@@ -675,7 +675,7 @@ def test_request_review_on_unclaimed_ready_synthesizes_run(kanban_home: Path) ->
     active run to close. The handoff summary must still be preserved on a
     synthesized run so the reviewer keeps the context."""
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="ready then review", assignee="worker")
+        tid = kb.create_task(conn, execution_authority="Isolated regression fixture", title="ready then review", assignee="worker")
         assert kb.get_task(conn, tid).status == "ready"
         assert kb.get_task(conn, tid).current_run_id is None
 
@@ -696,7 +696,7 @@ def test_request_review_on_unclaimed_ready_synthesizes_run(kanban_home: Path) ->
 def test_reviewer_reassigns_for_autonomous_dispatch(kanban_home: Path) -> None:
     """An explicit reviewer routes the review run while preserving implementer provenance."""
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="route reviewer", assignee="worker")
+        tid = kb.create_task(conn, execution_authority="Isolated regression fixture", title="route reviewer", assignee="worker")
         claimed = kb.claim_task(conn, tid)
         assert claimed is not None
         ok = kb.request_review(

@@ -399,3 +399,13 @@ class TestBridgeWiredInRuntime:
         agent.tool_progress_callback.assert_called_once()
         assert agent.tool_progress_callback.call_args.args[0] == "tool.started"
         assert agent.tool_progress_callback.call_args.args[1] == "exec_command"
+
+
+def test_runtime_activity_uses_a_content_free_description():
+    agent = _make_stub_agent()
+    agent._touch_activity = MagicMock()
+    callback = make_codex_app_server_event_bridge(agent)
+    callback({'method': 'item/reasoning/delta', 'params': {'delta': 'private content'}})
+    agent._touch_activity.assert_called_once_with('Codex runtime activity')
+    callback({'method': 'unrelated/notification', 'params': {}})
+    assert agent._touch_activity.call_count == 1
