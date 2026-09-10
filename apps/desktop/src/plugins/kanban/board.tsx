@@ -300,6 +300,9 @@ function Card({
           {summary && (
             <span className="line-clamp-2 text-[0.6875rem] leading-snug text-(--ui-text-tertiary)">{summary}</span>
           )}
+          {task.publication && (
+            <span className="text-[0.6875rem] text-(--ui-text-secondary)">{task.publication.label}</span>
+          )}
           <CardFooter arc={arc} task={task} />
         </div>
       </ContextMenuTrigger>

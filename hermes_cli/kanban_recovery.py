@@ -27,6 +27,38 @@ def required(conn, task):
     return bool(failure and (not saved or saved['failed_run_id'] != failure[0]))
 
 
+def observe_publication(task):
+    """Read local and remote identity without consuming publication authority."""
+    from hermes_cli.kanban_admission import _git, validate_repository
+    validate_repository(task)
+    head = _git(task.workspace_path, 'rev-parse', 'HEAD')
+    status = _git(task.workspace_path, 'status', '--porcelain=v1', '-z')
+    remote = _git(task.workspace_path, 'ls-remote', '--heads', 'origin', 'refs/heads/' + task.branch_name)
+    remote_lines = [line.split() for line in remote.splitlines() if line.strip()]
+    if len(remote_lines) > 1 or any(len(parts) != 2 for parts in remote_lines):
+        raise ValueError('Remote branch receipt is ambiguous')
+    remote_head = remote_lines[0][0] if remote_lines else None
+    repository = task.repository_identity.removeprefix('github.com/')
+    result = subprocess.run(
+        ['gh', 'pr', 'list', '--repo', repository, '--head', task.branch_name,
+         '--state', 'all', '--json', 'number,url,headRefOid,state,statusCheckRollup'],
+        check=True, capture_output=True, text=True, timeout=30,
+    )
+    prs = json.loads(result.stdout)
+    if not isinstance(prs, list) or len(prs) > 1:
+        raise ValueError('Pull request receipt is ambiguous')
+    if any(not isinstance(pr, dict) or not all(pr.get(key) for key in ('number', 'url', 'headRefOid', 'state')) for pr in prs):
+        raise ValueError('Pull request receipt is incomplete')
+    return dict(observed_at=int(time.time()), head=head,
+                    remote_head=remote_head, branch=task.branch_name, workspace=task.workspace_path,
+                    retained_changes=bool(status), status_digest=hashlib.sha256(status.encode()).hexdigest(),
+                    existing_commit=head != task.approved_base,
+                    pull_requests=[{'number': pr['number'], 'url': pr['url'], 'head': pr['headRefOid'],
+                                    'state': pr['state'], 'github_checks': pr.get('statusCheckRollup'),
+                                    'github_checks_state': 'reported' if pr.get('statusCheckRollup') else
+                                    'absent' if pr.get('statusCheckRollup') == [] else 'unavailable'} for pr in prs])
+
+
 def reconcile(conn, task_id):
     from hermes_cli import kanban_db as kb
     from hermes_cli.kanban_admission import _operator, _git, validate_repository
@@ -41,31 +73,15 @@ def reconcile(conn, task_id):
     failure = latest_failure(conn, task_id)
     if not failure:
         raise ValueError('Card has no failed attempt to reconcile')
-    head = _git(task.workspace_path, 'rev-parse', 'HEAD')
+    observed = observe_publication(task)
+    head = observed['head']
     status = _git(task.workspace_path, 'status', '--porcelain=v1', '-z')
-    remote = _git(task.workspace_path, 'ls-remote', '--heads', 'origin', 'refs/heads/' + task.branch_name)
-    remote_lines = [line.split() for line in remote.splitlines() if line.strip()]
-    if len(remote_lines) > 1 or any(len(parts) != 2 for parts in remote_lines):
-        raise ValueError('Remote branch receipt is ambiguous')
-    remote_head = remote_lines[0][0] if remote_lines else None
-    if remote_head and remote_head != head:
+    if observed['remote_head'] and observed['remote_head'] != head:
         raise ValueError('Remote branch differs from the retained local commit')
-    repository = task.repository_identity.removeprefix('github.com/')
-    result = subprocess.run(
-        ['gh', 'pr', 'list', '--repo', repository, '--head', task.branch_name,
-         '--state', 'all', '--json', 'number,url,headRefOid,state'],
-        check=True, capture_output=True, text=True, timeout=30,
-    )
-    prs = json.loads(result.stdout)
-    if not isinstance(prs, list) or len(prs) > 1:
-        raise ValueError('Pull request receipt is ambiguous')
-    if prs and (prs[0].get('headRefOid') != head or prs[0].get('state') != 'OPEN'):
+    if observed['pull_requests'] and (observed['pull_requests'][0]['head'] != head or
+                                     observed['pull_requests'][0]['state'] not in {'OPEN', 'MERGED'}):
         raise ValueError('Pull request state requires operator reconciliation')
-    observed = dict(failed_run_id=failure[0], observed_at=int(time.time()), head=head,
-                    remote_head=remote_head, branch=task.branch_name, workspace=task.workspace_path,
-                    retained_changes=bool(status), status_digest=hashlib.sha256(status.encode()).hexdigest(),
-                    existing_commit=head != task.approved_base,
-                    pull_requests=[{'number': pr['number'], 'url': pr['url'], 'head': pr['headRefOid']} for pr in prs])
+    observed['failed_run_id'] = failure[0]
     with kb.write_txn(conn):
         current = kb.get_task(conn, task_id)
         if current.current_run_id or current.claim_lock or latest_failure(conn, task_id)[0] != failure[0]:
@@ -73,6 +89,12 @@ def reconcile(conn, task_id):
         if _git(task.workspace_path, 'rev-parse', 'HEAD') != head or _git(task.workspace_path, 'status', '--porcelain=v1', '-z') != status:
             raise ValueError('Workspace changed during reconciliation')
         kb._append_event(conn, task_id, 'recovery_reconciled', observed)
+        if current.publication:
+            from hermes_cli.kanban_publication import consumed_actions, save
+            consumed = consumed_actions(observed)
+            save(conn, task_id, dict(current.publication,
+                                    actions=sorted(set(current.publication.get('actions', [])) - set(consumed)),
+                                    consumed_actions=consumed, reconciliation=observed))
     return observed
 
 

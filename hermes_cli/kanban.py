@@ -53,7 +53,8 @@ def _fmt_task_line(t: kb.Task) -> str:
     icon = _STATUS_ICONS.get(t.status, "?")
     assignee = t.assignee or "(unassigned)"
     tenant = f" [{t.tenant}]" if t.tenant else ""
-    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}"
+    publication = f" [{t.publication['label']}]" if t.publication else ""
+    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}{publication}"
 
 
 def _task_to_dict(t: kb.Task) -> dict[str, Any]:
@@ -68,6 +69,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "review_required": t.review_required,
         "task_scope": t.task_scope,
         "execution_authority": t.execution_authority,
+        "publication": t.publication,
         "repository_identity": t.repository_identity,
         "approved_base": t.approved_base,
         "workspace_kind": t.workspace_kind,
@@ -426,6 +428,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_authorise = sub.add_parser('authorise', help='Record task-specific execution authority')
     p_authorise.add_argument('task_id')
     p_authorise.add_argument('--authority', required=True)
+    p_authorise.add_argument('--publication-action', action='append',
+                            choices=['commit', 'push', 'pull_request', 'merge', 'verify'])
     p_create.add_argument("--review-required", action="store_true")
     p_create.add_argument("--model", default=None, dest="model_override",
                           help="Pin the worker to this model (passed as "
@@ -1699,7 +1703,8 @@ def _cmd_prepare(args):
 def _cmd_authorise(args):
     from hermes_cli.kanban_admission import authorise
     with kb.connect_closing() as conn:
-        task = authorise(conn, args.task_id, args.authority)
+        task = authorise(conn, args.task_id, args.authority,
+                         publication_actions=getattr(args, 'publication_action', None))
         print(json.dumps(_task_to_dict(task), indent=2))
     return 0
 
@@ -2484,13 +2489,10 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
-            # Goal-mode judge gate (mirrors tools/kanban_tools.py). Apply it
-            # to every terminal handoff so request-review cannot bypass the
-            # acceptance contract that protects complete.
             task = kb.get_task(conn, tid)
-            rejection = _goal_mode_handoff_rejection(
-                task,
-                (summary or args.result or "").strip(),
+            publication_handoff = (metadata or {}).get("review_outcome") == "accepted_pending_publication"
+            rejection = None if publication_handoff else _goal_mode_handoff_rejection(
+                task, (summary or args.result or "").strip(),
             )
             if rejection is not None:
                 print(
@@ -2511,7 +2513,8 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:
-                print(f"Completed {tid}")
+                landed = kb.get_task(conn, tid)
+                print(f"{landed.publication['label']} for {tid}" if publication_handoff else f"Completed {tid}")
     return 0 if not failed else 1
 
 

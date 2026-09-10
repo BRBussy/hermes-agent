@@ -13,6 +13,7 @@ export interface KanbanTask {
   tenant?: null | string
   created_at?: number
   latest_summary?: null | string
+  publication?: null | { phase: string, label: string }
   comment_count?: number
   link_counts?: { parents: number; children: number }
   /** N-of-M child completion, or null when the task has no children. */

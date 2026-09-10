@@ -62,6 +62,9 @@ def capture_state(task):
             "index": hashlib.sha256(git("ls-files", "--stage", "-z")).hexdigest(),
             "file_count": len(files),
             "all_files_digest": hashlib.sha256(json.dumps(files, ensure_ascii=True).encode()).hexdigest(),
+            "content_digest": hashlib.sha256(json.dumps(
+                [record for record in files if record[1] != "deleted"], ensure_ascii=True,
+            ).encode()).hexdigest(),
             "files": [record for record in files if os.fsencode(record[0]) in changed_names],
             "requirements": [task.title, task.body],
         }
@@ -87,7 +90,7 @@ def latest_submission(conn, task_id):
     return {"run_id": row["id"], "session_id": metadata.get("worker_session_id"), "state": state}
 
 
-def completion_rejection(conn, task, metadata, expected_run_id):
+def completion_rejection(conn, task, metadata, expected_run_id, *, outcome="approved"):
     from hermes_cli.kanban_db import _retry_status_for_run
 
     if (task.status != "running" or expected_run_id is None
@@ -101,7 +104,7 @@ def completion_rejection(conn, task, metadata, expected_run_id):
     session = metadata.get("worker_session_id")
     if not session or not submission["session_id"] or session == submission["session_id"]:
         return "Developer and reviewer must have distinct recorded session identities"
-    if metadata.get("review_outcome") != "approved" or not metadata.get("reviewer_checks"):
+    if metadata.get("review_outcome") != outcome or not metadata.get("reviewer_checks"):
         return "Reviewer acceptance and independent reviewer_checks are required"
     if metadata.get("reviewed_state_id") != submission["state"]["id"]:
         return "Reviewer must accept the submitted review state ID"

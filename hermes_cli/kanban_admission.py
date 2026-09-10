@@ -45,10 +45,13 @@ def rejection(task):
             validate_repository(task)
         except (ValueError, OSError, subprocess.SubprocessError) as exc:
             return str(exc)
+    from hermes_cli.kanban_publication import dispatch_rejection
+    if task.publication:
+        return dispatch_rejection(task)
     return None
 
 
-def authorise(conn, task_id, authority):
+def authorise(conn, task_id, authority, *, publication_actions=None):
     from hermes_cli import kanban_db as kb
     _operator()
     if not isinstance(authority, str) or not authority.strip():
@@ -58,7 +61,8 @@ def authorise(conn, task_id, authority):
         if active_worker_exists(conn, task_id):
             raise ValueError('A worker still owns this card')
         task = kb.get_task(conn, task_id)
-        if not task or task.status in {'running', 'done', 'archived'} or task.claim_lock:
+        if (not task or task.status in {'running', 'archived'} or task.claim_lock or task.current_run_id
+                or (task.status == 'done' and not publication_actions)):
             raise ValueError('Authorisation requires an inactive unfinished card')
         unresolved = conn.execute(
             "SELECT 1 FROM worker_attempts WHERE task_id = ? AND identity IS NULL "
@@ -67,12 +71,18 @@ def authorise(conn, task_id, authority):
         if unresolved:
             raise ValueError('Unverified startup requires process ownership reconciliation')
         from hermes_cli.kanban_recovery import required
-        if required(conn, task):
+        if task.status != 'done' and required(conn, task):
             raise ValueError('Reconcile the failed attempt before authorising recovery')
         if task.task_scope == 'repository' or task.workspace_kind == 'worktree' or task.project_id:
             validate_repository(task)
             from hermes_cli.kanban_worktree import retain
             retain(task)
+        if publication_actions is not None:
+            from hermes_cli.kanban_publication import authorise as authorise_publication
+            authorise_publication(conn, task, authority.strip(), publication_actions)
+        elif task.publication and task.publication['phase'] not in {'verified', 'reviewing_publication'}:
+            from hermes_cli.kanban_publication import save
+            save(conn, task_id, dict(task.publication, phase='changes_required', authority=None, actions=[]))
         conn.execute('UPDATE tasks SET execution_authority = ? WHERE id = ?', (authority.strip(), task_id))
         kb._append_event(conn, task_id, 'execution_authorised', {'authority': authority.strip()})
     return kb.get_task(conn, task_id)

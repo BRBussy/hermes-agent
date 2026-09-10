@@ -809,7 +809,7 @@ export function TaskDrawer({
             )}
 
             {task.latest_summary && !isAdminSummary(task.latest_summary) && (
-              <Section label={k.latestSummary}>
+              <Section label={task.publication?.label || k.latestSummary}>
                 <p className="whitespace-pre-wrap text-[0.8125rem] text-(--ui-text-secondary)">{task.latest_summary}</p>
               </Section>
             )}

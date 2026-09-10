@@ -1076,6 +1076,7 @@ class Task:
     tenant: Optional[str]
     task_scope: str = 'scratch'
     execution_authority: Optional[str] = None
+    publication: Optional[dict] = None
     repository_identity: Optional[str] = None
     approved_base: Optional[str] = None
     branch_name: Optional[str] = None
@@ -1180,6 +1181,7 @@ class Task:
             workspace_path=row["workspace_path"],
             task_scope=row['task_scope'] if 'task_scope' in keys else 'scratch',
             execution_authority=row['execution_authority'] if 'execution_authority' in keys else None,
+            publication=json.loads(row['publication']) if 'publication' in keys and row['publication'] else None,
             repository_identity=row['repository_identity'] if 'repository_identity' in keys else None,
             approved_base=row['approved_base'] if 'approved_base' in keys else None,
             branch_name=row["branch_name"] if "branch_name" in keys else None,
@@ -2621,6 +2623,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     for name, definition in (
         ('task_scope', "task_scope TEXT NOT NULL DEFAULT 'scratch'"),
         ('execution_authority', 'execution_authority TEXT'),
+        ('publication', 'publication TEXT'),
         ('repository_identity', 'repository_identity TEXT'),
         ('approved_base', 'approved_base TEXT'),
     ):
@@ -4927,6 +4930,7 @@ def goal_run_status(
                 "completed": "done",
                 "review_requested": "review",
                 "changes_requested": "changes_requested",
+                "publication_pending": "publication_pending",
                 "blocked": "blocked",
                 "dependency_wait": "blocked",
             }.get(outcome)
@@ -4943,8 +4947,8 @@ def goal_run_status(
             "ORDER BY id DESC LIMIT 1",
             (task_id,),
         ).fetchone()
-        if event and event["kind"] == "changes_requested":
-            return "changes_requested"
+        if event and event["kind"] in {"changes_requested", "publication_pending"}:
+            return event["kind"]
     return task.status
 
 
@@ -5506,6 +5510,15 @@ def complete_task(
     if not _parents_satisfied(conn, task_id):
         return False
 
+    if isinstance(metadata, dict) and metadata.get("review_outcome") == "accepted_pending_publication":
+        from hermes_cli.kanban_publication import accept_pending
+        with write_txn(conn):
+            if not _parents_satisfied(conn, task_id):
+                return False
+            return accept_pending(conn, get_task(conn, task_id),
+                                  redact_review_value(summary or result),
+                                  redact_review_value(metadata), expected_run_id)
+
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
     # tiny dedicated txn, then raise. The caller is responsible for
@@ -5552,6 +5565,15 @@ def complete_task(
                 _append_event(conn, task_id, "completion_blocked_review", {"reason": rejection})
                 conn.execute("UPDATE tasks SET last_failure_error = ? WHERE id = ?", (rejection, task_id))
                 return False
+        if task and task.publication:
+            from hermes_cli.kanban_publication import verify_delivery, save
+            rejection = verify_delivery(conn, task, metadata)
+            if rejection:
+                _append_event(conn, task_id, "completion_blocked_publication", {"reason": rejection})
+                conn.execute("UPDATE tasks SET last_failure_error = ? WHERE id = ?", (rejection, task_id))
+                return False
+            save(conn, task_id, dict(task.publication, phase="verified",
+                                    receipt=metadata.get("publication_receipt")))
         prior = conn.execute(
             "SELECT status FROM tasks WHERE id = ?",
             (task_id,),
@@ -6425,6 +6447,8 @@ def request_review(
             review_state = capture_state(task)
             metadata = dict(metadata, review_state=review_state)
         implementer = trow["assignee"]
+        if task.publication and reviewer is None:
+            reviewer = task.publication.get("reviewer")
         if reviewer is None:
             changes_run = conn.execute(
                 "SELECT id FROM task_runs "
@@ -6495,6 +6519,9 @@ def request_review(
                 "task is not in running/ready (or expected_run_id did not "
                 "match the current run)",
             )
+        if task.publication:
+            from hermes_cli.kanban_publication import save
+            save(conn, task_id, dict(task.publication, phase="reviewing_publication", reviewer=reviewer))
         run_id = _end_run(
             conn,
             task_id,
@@ -6607,10 +6634,6 @@ def request_changes(
             reviewer = None
 
         new_status = _landing_status_after_parents(conn, task_id)
-        # NOTE: consecutive_failures is deliberately PRESERVED (neither
-        # reset nor incremented). Review transitions are not evidence the
-        # pathology cleared — only complete_task's success path resets the
-        # breaker counter (mirrors unblock_task, #35072).
         cur = conn.execute(
             """
             UPDATE tasks
@@ -6625,6 +6648,11 @@ def request_changes(
         )
         if cur.rowcount != 1:
             return False, "task changed during review handoff"
+        task = get_task(conn, task_id)
+        if task.publication:
+            from hermes_cli.kanban_publication import save
+            save(conn, task_id, dict(task.publication, phase="changes_required", authority=None, actions=[]))
+            conn.execute("UPDATE tasks SET execution_authority = NULL WHERE id = ?", (task_id,))
         run_id = _end_run(
             conn,
             task_id,
@@ -10842,6 +10870,11 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     lines.append(f"Assignee: {task.assignee or '(unassigned)'}")
     lines.append(f"Status:   {task.status}")
     lines.append(f"Independent review required: {task.review_required}")
+    if task.publication:
+        lines.append("Publication handoff: " + json.dumps(task.publication))
+        lines.append("Preserve the accepted files and registered workspace. Perform only the recorded outstanding "
+                     "actions within their authority. Reconcile completed actions after interruption. "
+                     "The developer submits the published state for fresh independent review.")
     from hermes_cli.kanban_recovery import receipt
     recovery_receipt = receipt(conn, task_id)
     if recovery_receipt:
@@ -10859,6 +10892,8 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
                      "metadata.reviewed_state_id set to the submitted state, and metadata.reviewer_checks. "
                      "Changed deliverables require a developer resubmission. "
                      "Use kanban_request_changes for concrete corrections.")
+        lines.append("Select content acceptance pending publication when the reviewed content passes "
+                     "and the promised publication remains outstanding.")
     if task.tenant:
         lines.append(f"Tenant:   {task.tenant}")
     lines.append(f"Workspace: {task.workspace_kind} @ {task.workspace_path or '(unresolved)'}")

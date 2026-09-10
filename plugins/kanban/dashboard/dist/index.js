@@ -3106,6 +3106,7 @@
               ? h(Badge, { variant: "outline", className: "hermes-kanban-tag",
                            title: `Tenant: ${t.tenant}. Free-form tag for grouping tasks (customer, project, team).` }, t.tenant)
               : null,
+            t.publication ? h(Badge, { variant: "outline" }, t.publication.label) : null,
             progress
               ? h("span", {
                   className: cn(
@@ -3950,7 +3951,7 @@
         var isDone = t.status === "done";
         var isParent = links.children.length > 0;
         if (finalResult) {
-          var label = t.result
+          var label = t.publication ? t.publication.label : t.result
             ? tx(i18n, "result", "Result")
             : tx(i18n, "finalResult", "Final Result (run summary)");
           return h("div", { className: "hermes-kanban-section" },

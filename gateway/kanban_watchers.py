@@ -263,7 +263,7 @@ class GatewayKanbanWatchersMixin:
         # but is not a block (see kanban_db.request_review); the task is not
         # archived, so the subscription stays alive and later review
         # cycles keep notifying.
-        TERMINAL_KINDS = ("progress_warning", "recovery_required", "completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
+        TERMINAL_KINDS = ("progress_warning", "recovery_required", "completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested", "publication_pending")
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
         # so removing its subscription would silence a later reopen. We used
@@ -571,6 +571,7 @@ class GatewayKanbanWatchersMixin:
                     # exists on the board.
                     wake_handoff = ""
                     wake_review_detail = ""
+                    wake_publication_detail = ""
                     for ev in d["events"]:
                         kind = ev.kind
                         # Identity prefix: attribute terminal pings to the
@@ -657,6 +658,12 @@ class GatewayKanbanWatchersMixin:
                                 f"👀 {board_tag}{tag}Kanban {sub['task_id']} ready for review"
                                 f" — {title}{handoff}"
                             )
+                        elif kind == "publication_pending":
+                            payload = ev.payload or {}
+                            detail = _safe_review_reason(payload.get("summary"))
+                            msg = (f"✓ {board_tag}Kanban {sub['task_id']} content accepted, "
+                                   f"publication awaiting authority: {detail}")
+                            wake_publication_detail = "Content accepted. Record scoped publication authority and retain fresh published-state review. " + detail
                         elif kind == "changes_requested":
                             payload = ev.payload or {}
                             reason = _safe_review_reason(payload.get("reason"))
@@ -846,7 +853,7 @@ class GatewayKanbanWatchersMixin:
                         # ``unblocked`` stay out: bookkeeping.
                         _WAKE_KINDS = (
                             "completed", "gave_up", "crashed", "timed_out",
-                            "blocked", "review_requested", "changes_requested",
+                            "blocked", "review_requested", "changes_requested", "publication_pending",
                             "block_loop_detected",
                         )
                         _wake_kinds = (
@@ -887,6 +894,7 @@ class GatewayKanbanWatchersMixin:
                             if "blocked" in _wake_kinds: _parts.append(t("gateway.kanban.wake.blocked"))
                             if "review_requested" in _wake_kinds: _parts.append(t("gateway.kanban.wake.review_requested"))
                             if "changes_requested" in _wake_kinds: _parts.append(t("gateway.kanban.wake.changes_requested"))
+                            if "publication_pending" in _wake_kinds: _parts.append("content accepted with publication pending")
                             if "block_loop_detected" in _wake_kinds: _parts.append(t("gateway.kanban.wake.block_loop_detected"))
                             _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
                             _synth = t(
@@ -912,6 +920,8 @@ class GatewayKanbanWatchersMixin:
                                     "gateway.kanban.wake.review_detail",
                                     reason=wake_review_detail,
                                 )
+                            if wake_publication_detail:
+                                _synth += "\n" + wake_publication_detail
                             _synth += "\n\n" + t(
                                 "gateway.kanban.wake.guidance"
                             )

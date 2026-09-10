@@ -496,6 +496,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "review_required": task.review_required,
         "task_scope": task.task_scope,
         "execution_authority": task.execution_authority,
+        "publication": task.publication,
         "repository_identity": task.repository_identity,
         "approved_base": task.approved_base,
         "workspace_kind": task.workspace_kind,
@@ -550,6 +551,7 @@ def _handle_show(args: dict, **kw) -> str:
                     "assignee": t.assignee, "status": t.status,
                     "tenant": t.tenant, "priority": t.priority,
                     "review_required": t.review_required,
+                    "publication": t.publication,
                     "workspace_kind": t.workspace_kind,
                     "workspace_path": t.workspace_path,
                     "created_by": t.created_by, "created_at": t.created_at,
@@ -758,15 +760,10 @@ def _handle_complete(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
-            # Goal-mode pre-completion judge gate (Issue #38367).
-            # Prevent workers from bypassing the auxiliary judge by
-            # calling kanban_complete before acceptance criteria are met.
-            # Only enforce when a judge is actually reachable — see
-            # _goal_judge_available for why an unavailable judge fails open.
             task = kb.get_task(conn, tid)
-            rejection = _goal_mode_handoff_rejection(
-                task,
-                (summary or result or "").strip(),
+            publication_handoff = (metadata or {}).get("review_outcome") == "accepted_pending_publication"
+            rejection = None if publication_handoff else _goal_mode_handoff_rejection(
+                task, (summary or result or "").strip(),
             )
             if rejection is not None:
                 return tool_error(
@@ -817,7 +814,10 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"{getattr(kb.get_task(conn, tid), 'last_failure_error', None) or 'unknown id or already terminal'}"
                 )
             run = kb.latest_run(conn, tid)
-            return _ok(task_id=tid, run_id=run.id if run else None)
+            landed = kb.get_task(conn, tid)
+            return _ok(task_id=tid, run_id=run.id if run else None,
+                       status=landed.status if landed else None,
+                       publication=landed.publication if landed else None)
         finally:
             conn.close()
     except ValueError as e:
@@ -1787,21 +1787,17 @@ KANBAN_LIST_SCHEMA = {
 KANBAN_COMPLETE_SCHEMA = {
     "name": "kanban_complete",
     "description": (
-        "Mark your current task done with a structured handoff for "
-        "downstream workers and humans. Prefer ``summary`` for a "
-        "human-readable 1-3 sentence description of what you did; put "
-        "machine-readable facts in ``metadata`` (changed_files, "
-        "tests_run, decisions, findings, etc). At least one of "
-        "``summary`` or ``result`` is required. If you created new "
-        "tasks via ``kanban_create`` during this run, list their ids "
-        "in ``created_cards`` — the kernel verifies them so phantom "
-        "references are caught before they leak into downstream "
-        "automation. If you produced deliverable files (charts, PDFs, "
-        "spreadsheets, generated images), list their absolute paths "
-        "in ``artifacts`` — the gateway notifier will upload them as "
-        "native attachments to the human who subscribed to the task, "
-        "so the deliverable lands in their chat alongside the summary "
-        "instead of being a path they have to fetch by hand."
+        "Complete verified work, or record accepted content awaiting publication. "
+        "Provide summary or result, with verification facts in metadata. "
+        "Independent reviewers can use metadata.review_outcome='accepted_pending_publication', "
+        "metadata.reviewed_state_id, metadata.reviewer_checks and metadata.publication.deliverable "
+        "(branch, pull_request or merge). That outcome retains the unfinished card for "
+        "scoped publication authority and a fresh developer submission and independent review. "
+        "Final required review uses metadata.review_outcome='approved' with the submitted "
+        "reviewed_state_id and independent reviewer_checks. Changed content requires fresh acceptance. "
+        "List task IDs created during this run in created_cards for ownership verification. "
+        "List absolute deliverable paths in artifacts for preservation and delivery "
+        "to the task's subscribed chat on completion."
     ),
     "parameters": {
         "type": "object",
