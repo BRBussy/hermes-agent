@@ -497,6 +497,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "task_scope": task.task_scope,
         "execution_authority": task.execution_authority,
         "publication": task.publication,
+        "blocker_state": task.blocker_state,
         "repository_identity": task.repository_identity,
         "approved_base": task.approved_base,
         "workspace_kind": task.workspace_kind,
@@ -552,6 +553,7 @@ def _handle_show(args: dict, **kw) -> str:
                     "tenant": t.tenant, "priority": t.priority,
                     "review_required": t.review_required,
                     "publication": t.publication,
+                    "blocker_state": t.blocker_state,
                     "workspace_kind": t.workspace_kind,
                     "workspace_path": t.workspace_path,
                     "created_by": t.created_by, "created_at": t.created_at,
@@ -889,6 +891,7 @@ def _handle_block(args: dict, **kw) -> str:
                 reason=reason,
                 summary=summary, metadata=metadata,
                 kind=kind,
+                blocker_id=args.get("blocker_id"),
                 expected_run_id=_worker_run_id(tid),
             )
             if not ok:
@@ -905,6 +908,7 @@ def _handle_block(args: dict, **kw) -> str:
                 run_id=run.id if run else None,
                 status=landed.status if landed else "blocked",
                 block_kind=kind,
+                blocker_state=landed.blocker_state if landed else None,
             )
         finally:
             conn.close()
@@ -1650,7 +1654,9 @@ def _handle_unblock(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
-            ok = kb.unblock_task(conn, str(tid))
+            ok = kb.unblock_task(conn, str(tid),
+                                 resolved_blocker_id=args.get("resolved_blocker_id"),
+                                 resolution=args.get("resolution"))
             if not ok:
                 return tool_error(f"could not unblock {tid} (not blocked or unknown)")
             task = kb.get_task(conn, str(tid))
@@ -1878,16 +1884,11 @@ KANBAN_COMPLETE_SCHEMA = {
 KANBAN_BLOCK_SCHEMA = {
     "name": "kanban_block",
     "description": (
-        "Stop work on this task and route it according to WHY you're stuck. "
-        "Set ``kind`` to say which: 'dependency' (waiting on another task — "
-        "goes to todo and auto-resumes when that task finishes, no human "
-        "needed), 'needs_input' (you need a human decision/answer), "
-        "'capability' (a hard wall: no access, missing credentials, an action "
-        "no agent can do), or 'transient' (a flaky failure that may clear). "
-        "``reason`` is shown to the human on the board. If a task keeps "
-        "getting unblocked and re-blocked for the same reason, it is "
-        "auto-escalated to triage. Use for genuine blockers only — don't "
-        "block on things you can resolve yourself."
+        "Report an external blocker and the action needed. Reuse blocker_id for "
+        "the same unresolved condition across attempts, even when wording changes. "
+        "Use distinct IDs for distinct conditions. Omission shares the conservative "
+        "unspecified identity. Repeated unresolved reports require recorded resolution "
+        "before resumption. Dependency blocks wait in todo for parent completion."
     ),
     "parameters": {
         "type": "object",
@@ -1900,16 +1901,17 @@ KANBAN_BLOCK_SCHEMA = {
                 "type": "string",
                 "description": (
                     "What you need answered or what stopped you, in one or "
-                    "two sentences. Don't paste the whole conversation; the "
+                    "two sentences. Don't paste the whole conversation. The "
                     "human has the board and can ask follow-ups via comments."
                 ),
             },
+            "blocker_id": {"type": "string", "description": "Stable non-secret cause ID scoped to this task, for example publication-approval. Reuse the ID from kanban_show for the same condition."},
             "kind": {
                 "type": "string",
                 "enum": ["dependency", "needs_input", "capability", "transient"],
                 "description": (
                     "Why you're blocked. 'dependency' waits in todo and "
-                    "resumes automatically; the others surface to a human. "
+                    "resumes automatically. The others surface to a human. "
                     "Omit only if none apply."
                 ),
             },
@@ -1927,11 +1929,7 @@ KANBAN_REQUEST_REVIEW_SCHEMA = {
         "Hand the task off for review: implementation, self-review, and "
         "verification are complete and you want a human (or reviewer) to "
         "look before it is marked done. Moves the task to the 'review' "
-        "column and notifies the subscriber. Unlike ``kanban_block`` this is "
-        "NOT a blocker — it never counts toward unblock-loop detection, so a "
-        "task can cycle through review across follow-ups without ever being "
-        "falsely escalated to triage. Use this instead of blocking with a "
-        "free-form 'review-required:' reason."
+        "column and notifies the subscriber. Review cycles preserve blocker episodes."
     ),
     "parameters": {
         "type": "object",
@@ -2337,8 +2335,8 @@ KANBAN_UNBLOCK_SCHEMA = {
     "name": "kanban_unblock",
     "description": (
         "Unblock a Kanban task. It moves to ready when all parents are done, "
-        "or todo while any parent remains open. Orchestrator-only — only "
-        "profiles with the kanban toolset can unblock routed work; "
+        "or todo while any parent remains open. Orchestrator-only. Only "
+        "profiles with the kanban toolset can unblock routed work. "
         "dispatcher-spawned task workers never see this tool."
     ),
     "parameters": {
@@ -2348,6 +2346,8 @@ KANBAN_UNBLOCK_SCHEMA = {
                 "type": "string",
                 "description": "Blocked task id to move to ready or parent-gated todo.",
             },
+            "resolved_blocker_id": {"type": "string", "description": "ID of the condition actually resolved. Omit for an unresolved retry."},
+            "resolution": {"type": "string", "description": "Evidence of what resolved that condition. Required with resolved_blocker_id."},
             "board": _board_schema_prop(),
         },
         "required": ["task_id"],

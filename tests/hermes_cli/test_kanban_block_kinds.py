@@ -1,19 +1,4 @@
-"""Tests for typed block reasons + the unblock-loop breaker.
-
-Covers the built-in fix for the kanban "blocked loop" — a worker blocks a
-task, a cron unblocks it, the worker re-blocks for the same reason, repeat
-forever. The fix gives ``block_task`` a typed ``kind`` and a persistent
-``block_recurrences`` counter:
-
-* ``dependency`` blocks route to ``todo`` (parent-gated, auto-resumed) and
-  never enter the human ``blocked`` bucket a cron would keep unblocking.
-* ``needs_input`` / ``capability`` / un-typed blocks land in ``blocked``;
-  each same-cause re-block after an unblock increments ``block_recurrences``,
-  and at ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
-* ``unblock_task`` deliberately does NOT reset ``block_recurrences`` (the
-  amnesia that let the loop run unbounded).
-* A successful ``complete_task`` resets the loop memory.
-"""
+"""Typed dependency routing and unresolved blocker escalation."""
 
 from __future__ import annotations
 
@@ -36,7 +21,7 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 def _running_task(conn, title="t"):
     """Create a task and drive it to ``running`` so block_task can act."""
-    tid = kb.create_task(conn, title=title, assignee="worker")
+    tid = kb.create_task(conn, title=title, assignee="worker", execution_authority="Isolated blocker regression")
     with kb.write_txn(conn):
         conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
     claimed = kb.claim_task(conn, tid, claimer="worker")
@@ -66,10 +51,10 @@ def _make_running_again(conn, tid):
 def test_block_loop_detected_event_emitted(kanban_home: Path) -> None:
     with kb.connect_closing() as conn:
         tid = _running_task(conn)
-        kb.block_task(conn, tid, reason="x", kind="capability")
+        kb.block_task(conn, tid, reason="x", kind="capability", expected_run_id=kb.get_task(conn, tid).current_run_id)
         kb.unblock_task(conn, tid)
         _make_running_again(conn, tid)
-        kb.block_task(conn, tid, reason="x", kind="capability")
+        kb.block_task(conn, tid, reason="x", kind="capability", expected_run_id=kb.get_task(conn, tid).current_run_id)
         events = [e for e in kb.list_events(conn, tid)
                   if e.kind == "block_loop_detected"]
         assert events, "expected a block_loop_detected event"
@@ -86,16 +71,16 @@ def test_block_loop_detected_event_emitted(kanban_home: Path) -> None:
 def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:
     """A dependency-parked child becomes ready once its parent completes."""
     with kb.connect_closing() as conn:
-        parent = kb.create_task(conn, title="parent", assignee="worker")
+        parent = kb.create_task(conn, title="parent", assignee="worker", execution_authority="Isolated blocker regression")
         child = _running_task(conn, title="child")
         kb.link_tasks(conn, parent_id=parent, child_id=child)
-        kb.block_task(conn, child, reason="wait", kind="dependency")
+        assert kb.block_task(conn, child, reason="wait", kind="dependency", expected_run_id=kb.get_task(conn, child).current_run_id)
         assert kb.get_task(conn, child).status == "todo"
         # Finish the parent, then let recompute_ready run.
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (parent,))
         kb.claim_task(conn, parent, claimer="worker")
-        kb.complete_task(conn, parent, result="done")
+        assert kb.complete_task(conn, parent, result="done", expected_run_id=kb.get_task(conn, parent).current_run_id)
         kb.recompute_ready(conn)
         assert kb.get_task(conn, child).status == "ready"
 

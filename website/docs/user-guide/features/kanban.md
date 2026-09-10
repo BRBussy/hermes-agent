@@ -308,17 +308,35 @@ are complete, or **`todo`** while any parent remains open. A `todo` task keeps
 its source-phase provenance and returns to `review` or `ready` automatically
 when the dependency gate clears. `unblock` never routes directly to `triage`.
 
-If you unblock a task and it later shows up in **`triage`**, the unblock is not
-what put it there. A subsequent *re-block for the same reason* did: after a task
-is blocked → unblocked → re-blocked for the same cause `BLOCK_RECURRENCE_LIMIT`
-times (default `2`), the unblock-loop breaker stops sending it back to `blocked`
-— where a cron would just keep unblocking it — and routes it to `triage` for a
-human decision. This is a deterministic DB guard, not an LLM judgment call, and
-a task's body text cannot opt out of it: the recurrence counter deliberately
-survives each unblock (it resets only on a successful `complete`). To keep an
-unblocked task in the work pool, resolve *why it keeps re-blocking* (unfinished
-parent, missing input, unmet capability) before unblocking, or raise
-`BLOCK_RECURRENCE_LIMIT` if the loop is expected.
+Worker reports count by a stable, task-scoped `blocker_id`. Reuse the ID for the
+same unresolved external condition, even when its wording or category changes.
+Different conditions use different IDs. Each unresolved identity keeps its own
+count across retries, intervening blockers and restarts. A report without an ID
+uses `unspecified`, so changing prose does not reset protection.
+
+At `BLOCK_RECURRENCE_LIMIT` (default `2` reports), the card stays **Blocked** and
+emits `block_loop_detected`. The notification names the identity, reason and
+requested action. Resumption requires `resolved_blocker_id` and a non-empty
+`resolution` note that records what resolved the condition. CLI unblock accepts
+these as `--resolved-blocker-id` and `--resolution`. The orchestrator unblock tool
+and dashboard task PATCH accept the same fields. Dashboard drag-to-Ready and bulk
+resumption preserve counters and cannot resume an unresolved escalation.
+
+Resolution and resumption commit together. A later report using that ID starts a
+new numbered episode with count one. `kanban_show`, CLI show and dashboard task
+JSON expose `blocker_state`, including all known identities. A plain retry before
+the limit preserves unresolved counts. Operator pauses do not add reports.
+Dependency waits preserve blocker state and follow their parent gate.
+
+Existing category-only counters are exposed as an unresolved `unspecified`
+identity, with their count retained. A new explicit ID starts independently.
+Typed and untyped event history remains readable. Existing Triage cards retain
+their recorded status. A card with a retained blocker count can resume through
+explicit resolution of its `unspecified` identity.
+Successful completion clears active counters, with events retaining reported
+blockers and resolution receipts. These lifecycle controls do not establish the
+truth of an operator's resolution note.
+
 :::
 
 ## How workers interact with the board
@@ -332,7 +350,7 @@ parent, missing input, unmet capability) before unblocking, or raise
 | `kanban_complete` | Finish with `summary` + `metadata` structured handoff. | at least one of `summary` / `result` |
 | `kanban_request_review` | Start same-card review with a durable `summary`, optional `metadata`, and optional reviewer profile. The task moves to `review`; this is not a block. | `summary` |
 | `kanban_request_changes` | Reviewer verdict from an active review run. Closes that run, reapplies parent gating, and routes the task to its original implementer without block-loop accounting. | `reason` |
-| `kanban_block` | Stop work and route by why: `kind=dependency` (waits in `todo`, auto-resumes), `needs_input`/`capability`/`transient` (surface to a human). Repeated same-kind re-blocks auto-escalate to `triage`. | `reason` |
+| `kanban_block` | Stop work and route by why: `kind=dependency` (waits in `todo`, auto-resumes), `needs_input`/`capability`/`transient` (surface to a human). Repeated unresolved identities require recorded resolution while held in `blocked`. | `reason` |
 | `kanban_heartbeat` | Signal liveness during long operations. Pure side-effect. | — |
 | `kanban_comment` | Append a durable note to the task thread. | `task_id`, `body` |
 | `kanban_attach` | Attach a file to a task by passing its bytes inline (base64); stored under the task's attachments dir (25 MB cap). | file bytes + name |
@@ -1035,7 +1053,7 @@ Workers receive `$HERMES_TENANT` and namespace their memory writes by prefix. Th
 
 ## Desktop notifications
 
-The Desktop app's Kanban plugin surfaces the same terminal events natively — no gateway platform required. While the Kanban board's live event socket is connected, each `completed`, `blocked`, `gave_up`, `crashed`, `timed_out`, or routed-to-triage (`block_loop_detected`) event raises an in-app toast with the worker's handoff (summary, block reason, or error) and an "Open Kanban" action. When you're away from the Hermes window, the same event also fires a native OS notification (gated by **Settings ▸ Notifications ▸ Plugin notifications**), so a task hitting a blocker while you're in another app still reaches you.
+The Desktop app's Kanban plugin surfaces terminal events natively. While the Kanban board's live event socket is connected, each `completed`, `blocked`, `gave_up`, `crashed`, `timed_out`, or blocker escalation (`block_loop_detected`) event raises an in-app toast with the worker's handoff (summary, block reason, or error) and an "Open Kanban" action. When you're away from the Hermes window, the same event also fires a native OS notification (gated by **Settings ▸ Notifications ▸ Plugin notifications**), so a task hitting a blocker while you're in another app still reaches you.
 
 Coverage window: desktop notifications ride the live event stream, so they fire only while the app is running with the Kanban plugin enabled. Events that land while the app is closed are not replayed as notifications on next launch — use a gateway subscription (below) for delivery that must survive the app being closed.
 
@@ -1068,7 +1086,7 @@ A subscription removes itself automatically once the task reaches `done` or `arc
 
 A "wake" forges a synthetic inbound message to the destination gateway agent so it takes a normal turn (reads the comment + result, reasons, replies) instead of getting a one-line passive notification. It only fires when the notifier runs inside a live gateway process; otherwise a `notify+wake` subscription still delivers its passive message, while a `wake`-only subscription does nothing in that process.
 
-**Which events wake.** The ones that hand a decision back to the origin: `completed`, `blocked`, `gave_up`, `crashed`, `timed_out`, `review_requested` (a worker finished the implementation and handed off via `kanban_request_review`) and `block_loop_detected` (the task was routed to `triage` after repeated blocks). `status`, `archived` and `unblocked` are delivered but never wake — they are bookkeeping transitions, not decisions. When a `completed` or `review_requested` event carries a summary, that handoff rides the wake turn, so the woken agent sees what the worker actually did.
+**Which events wake.** The ones that hand a decision back to the origin: `completed`, `blocked`, `gave_up`, `crashed`, `timed_out`, `review_requested` (a worker finished the implementation and handed off via `kanban_request_review`) and `block_loop_detected` (repeated unresolved blocker reports require operator resolution). `status`, `archived` and `unblocked` are bookkeeping transitions that do not wake the coordinator. When a `completed` or `review_requested` event carries a summary, that handoff rides the wake turn, so the woken agent sees what the worker actually did.
 
 `--chat-type` (`dm` | `group` | `channel` | `thread`) records the originating chat's type so a woken turn resolves the operator's **real** session: `build_session_key` keys groups, channels, and threads differently from DMs, so an inaccurate `chat_type` would route the wake into a separate, context-less session. The `/kanban` auto-subscribe and slash-command paths capture this automatically — you only set it by hand when subscribing a chat from a script or cron. Omit it to leave an existing subscription unchanged (new subscriptions default to `dm`).
 
@@ -1162,10 +1180,10 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 | `promoted` | — | `todo → ready` because all parents hit `done`. `run_id` is `NULL`. |
 | `claimed` | `{lock, expires, run_id}` | Dispatcher atomically claimed a `ready` task for spawn. |
 | `completed` | `{result_len, summary?}` | Worker wrote `--result` / `--summary` and task hit `done`. `summary` is the first-line handoff (400-char cap); full version lives on the run row. If `complete_task` is called on a never-claimed task with handoff fields, a zero-duration run is synthesized so `run_id` still points at something. |
-| `blocked` | `{reason, kind, recurrences}` | Worker or human flipped the task to `blocked`. `kind` is the typed block reason (`needs_input`, `capability`, `transient`, or `null` for a generic block); `recurrences` is the unblock-loop counter. Synthesizes a zero-duration run when called on a never-claimed task with `--reason`. |
+| `blocked` | `{reason, kind, blocker_id, episode, recurrences}` | Worker blocker report or operator hold. Worker reports identify the condition and episode. Operator holds preserve counters. |
 | `dependency_wait` | `{reason, kind}` | Worker blocked with `kind=dependency` — the task is only waiting on another task, so it routes to `todo` (parent-gated, auto-promoted) instead of `blocked`. No human needed. |
-| `block_loop_detected` | `{reason, kind, recurrences, limit}` | A task was unblocked and re-blocked for the same reason `BLOCK_RECURRENCE_LIMIT` times (default 2). Instead of landing in `blocked` again — where a cron would keep unblocking it — it routes to `triage` for a human decision, breaking the unblock↔re-block loop. |
-| `unblocked` | — | `blocked → ready` (or `todo` if parents are still open), either manually or via `/unblock`. Resets the dispatcher's `consecutive_failures` but deliberately preserves `block_recurrences` so the loop breaker keeps its memory. `run_id` is `NULL`. |
+| `block_loop_detected` | `{reason, kind, blocker_id, episode, recurrences, limit, requires_resolution}` | One unresolved identity reached its report limit. The card stays blocked until a resolution receipt is supplied. Historical events without `requires_resolution` retain their recorded Triage interpretation. |
+| `unblocked` | `{status, resume_status}` when applicable | Explicit resumption restores the source phase and preserves unresolved counters. A supplied resolution also emits `blocker_resolved` with identity, episode, count and note. |
 | `archived` | — | Hidden from the default board. If the task was still running, carries the `run_id` of the run that was reclaimed as a side effect. |
 
 **Edits** (human-driven changes that aren't transitions):

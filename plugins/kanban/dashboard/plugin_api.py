@@ -846,6 +846,8 @@ class UpdateTaskBody(BaseModel):
     body: Optional[str] = None
     result: Optional[str] = None
     block_reason: Optional[str] = None
+    resolved_blocker_id: Optional[str] = None
+    resolution: Optional[str] = None
     # Structured handoff fields — forwarded to complete_task when status
     # transitions to 'done'. Dashboard parity with ``hermes kanban
     # complete --summary ... --metadata ...``.
@@ -940,8 +942,11 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 # status set. "Changes requested" (review -> ready) goes through
                 # reopen_review_task via _reopen_if_review.
                 current = kanban_db.get_task(conn, task_id)
-                if current and current.status in ("blocked", "scheduled"):
-                    ok = kanban_db.unblock_task(conn, task_id)
+                if current and (current.status in ("blocked", "scheduled")
+                                or (current.status == "triage" and payload.resolved_blocker_id)):
+                    ok = kanban_db.unblock_task(conn, task_id,
+                                                resolved_blocker_id=payload.resolved_blocker_id,
+                                                resolution=payload.resolution)
                 else:
                     reopened = _reopen_if_review(conn, task_id, current)
                     # Direct status write for drag-drop (todo -> ready etc).

@@ -119,18 +119,12 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 #
 # ``needs_input`` and ``capability`` are "truly blocked": they go to ``blocked``
 # for a human, and the unblock-loop breaker (see ``block_task`` /
-# ``BLOCK_RECURRENCE_LIMIT``) escalates them to ``triage`` if a cron keeps
+# ``BLOCK_RECURRENCE_LIMIT``) requires recorded resolution if automation keeps
 # unblocking them only to have the worker re-block for the same reason.
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 
-# After a task has been blocked, unblocked, and re-blocked this many times for
-# the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
-# unblocker (usually a cron) and routes the task to ``triage`` instead of back
-# to ``blocked`` — breaking the infinite unblock↔re-block loop and forcing a
-# human-in-the-loop decision. Mirrors the dispatcher's ``DEFAULT_FAILURE_LIMIT``
-# spirit (default 2) but counts a different signal: manual unblock recurrences,
-# not dispatcher spawn/crash/timeout failures.
+# Count worker reports within one unresolved blocker episode.
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
@@ -1146,13 +1140,9 @@ class Task:
     # set the env var. Lets clients render a per-session board without
     # relying on tenant + time-window heuristics.
     session_id: Optional[str] = None
-    # Typed block reason (one of VALID_BLOCK_KINDS) or None for legacy/un-typed
-    # blocks. Set by ``block_task``; preserved across unblock so a re-block for
-    # the same kind is recognisable as an unblock↔re-block loop.
     block_kind: Optional[str] = None
-    # Unblock-loop counter. See the column comment in SCHEMA_SQL and
-    # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    blocker_state: Optional[dict] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1248,6 +1238,8 @@ class Task:
             block_kind=(
                 row["block_kind"] if "block_kind" in keys and row["block_kind"] else None
             ),
+            blocker_state=_blocker_state(row["blocker_state"] if "blocker_state" in keys else None,
+                                         int(row["block_recurrences"] or 0) if "block_recurrences" in keys else 0),
             block_recurrences=(
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
@@ -1428,18 +1420,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- set the env var. Indexed so per-session list queries stay cheap on
     -- larger boards.
     session_id           TEXT,
-    -- Typed block reason set by ``block_task`` (one of VALID_BLOCK_KINDS, or
-    -- NULL for legacy/un-typed blocks). Drives routing: ``dependency`` never
-    -- sits in ``blocked`` (goes to ``todo`` for parent-gating); the others go
-    -- to ``blocked`` for a human. Preserved across unblock so a re-block for
-    -- the SAME kind can be recognised as a loop.
     block_kind           TEXT,
-    -- Unblock-loop counter. Incremented each time a task is re-blocked for the
-    -- same truly-blocked reason after having been unblocked. When it reaches
-    -- BLOCK_RECURRENCE_LIMIT the task is routed to ``triage`` instead of
-    -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
-    -- successful completion — NOT on unblock (resetting on unblock is exactly
-    -- the amnesia that let the loop run unbounded).
     block_recurrences    INTEGER NOT NULL DEFAULT 0
 );
 
@@ -2729,6 +2710,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences",
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
+
+    _add_column_if_missing(conn, "tasks", "blocker_state", "blocker_state TEXT")
 
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
@@ -4515,11 +4498,11 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     """Explicit blocks and blocks without provenance require explicit resumption."""
     row = conn.execute(
         "SELECT kind FROM task_events "
-        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
+        "WHERE task_id = ? AND kind IN ('blocked', 'block_loop_detected', 'unblocked') "
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    return row is None or row["kind"] == "blocked"
+    return row is None or row["kind"] in {"blocked", "block_loop_detected"}
 
 
 def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
@@ -4650,6 +4633,8 @@ def claim_task(
         from hermes_cli.kanban_admission import rejection
         candidate = get_task(conn, task_id)
         if candidate is None:
+            return None
+        if _blocker_requires_resolution(candidate.blocker_state or {}):
             return None
         from hermes_cli.kanban_recovery import required
         reason = 'Publication reconciliation is required' if required(conn, candidate) else rejection(candidate)
@@ -4790,6 +4775,8 @@ def claim_review_task(
         from hermes_cli.kanban_admission import rejection
         candidate = get_task(conn, task_id)
         if candidate is None:
+            return None
+        if _blocker_requires_resolution(candidate.blocker_state or {}):
             return None
         from hermes_cli.kanban_recovery import required
         reason = 'Publication reconciliation is required' if required(conn, candidate) else rejection(candidate)
@@ -5590,7 +5577,7 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL,
                        block_kind   = NULL,
-                       block_recurrences = 0
+                       block_recurrences = 0, blocker_state = NULL
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review')
                 """,
@@ -5607,7 +5594,7 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL,
                        block_kind   = NULL,
-                       block_recurrences = 0
+                       block_recurrences = 0, blocker_state = NULL
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review')
                    AND current_run_id = ?
@@ -6157,6 +6144,24 @@ def edit_completed_task_result(
     return True
 
 
+def _blocker_requires_resolution(state: dict) -> bool:
+    active = state.get("issues", {}).get(state.get("active_id"), {})
+    return not active.get("resolved") and active.get("count", 0) >= BLOCK_RECURRENCE_LIMIT
+
+
+def _blocker_state(raw: Optional[str], recurrences: int) -> dict:
+    if raw:
+        return json.loads(raw)
+    state = {"active_id": None, "issues": {}}
+    if recurrences:
+        # Category-only records cannot establish a cause identity.
+        state["active_id"] = "unspecified"
+        state["issues"]["unspecified"] = {
+            "count": recurrences, "episode": 1, "resolved": False, "migrated": True,
+        }
+    return state
+
+
 def block_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6165,23 +6170,32 @@ def block_task(
     summary: Optional[str] = None,
     metadata: Optional[dict] = None,
     kind: Optional[str] = None,
+    blocker_id: Optional[str] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
     """Hold work until explicit resumption, or wait on dependencies in ``todo``.
 
     Operator holds stop the verified worker and stay blocked across repeated
     holds. Worker calls supply their current run ID for a cooperative handoff.
-    Repeated worker blocks of one kind escalate at BLOCK_RECURRENCE_LIMIT.
+    Reuse a task-scoped blocker_id for one external condition, across wording
+    and kind changes. Distinct conditions use distinct IDs. Missing IDs share
+    the conservative unspecified identity. Resumption is not resolution.
+    The limit requires a resolution receipt before resuming an escalated hold.
     """
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    if blocker_id is not None and (
+        not isinstance(blocker_id, str)
+        or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.:/-]{0,127}", blocker_id)
+    ):
+        raise ValueError("blocker_id must be a non-secret identifier of 1 to 128 ASCII characters")
     operator_hold = expected_run_id is None and kind != "dependency"
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
+            "SELECT status, block_kind, block_recurrences, blocker_state FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if cur_row is None or cur_row["status"] not in {"todo", "ready", "running", "review"}:
@@ -6197,7 +6211,6 @@ def block_task(
             if cur_row["status"] == "running"
             else ("review" if cur_row["status"] == "review" else "ready")
         )
-        prev_kind = cur_row["block_kind"] if "block_kind" in cur_row.keys() else None
         prev_recurrences = (
             int(cur_row["block_recurrences"])
             if "block_recurrences" in cur_row.keys()
@@ -6251,14 +6264,43 @@ def block_task(
             )
             return True
 
-        same_cause = prev_kind == kind
-        recurrences = prev_recurrences if operator_hold else (prev_recurrences + 1 if same_cause else 1)
+        state = _blocker_state(cur_row["blocker_state"], prev_recurrences)
+        issues = state["issues"]
+        identity = blocker_id or "unspecified"
+        recurrences = prev_recurrences
+        if not operator_hold:
+            issue = issues.get(identity, {})
+            resolved = issue.get("resolved", False)
+            recurrences = 1 if resolved else int(issue.get("count", 0)) + 1
+            issues[identity] = {"count": recurrences,
+                                "episode": int(issue.get("episode", 0)) + int(resolved or not issue),
+                                "resolved": False, "kind": kind, "reason": reason}
+            state["active_id"] = identity
+        blocker_payload = {} if operator_hold else {
+            "blocker_id": identity, "episode": issues[identity]["episode"],
+            "requires_resolution": recurrences >= BLOCK_RECURRENCE_LIMIT,
+        }
 
-        if not operator_hold and recurrences >= BLOCK_RECURRENCE_LIMIT:
+        if expected_run_id is None:
             cur = conn.execute(
                 """
                 UPDATE tasks
-                   SET status        = 'triage',
+                   SET status        = 'blocked',
+                       claim_lock    = NULL,
+                       claim_expires = NULL,
+                       worker_pid    = NULL,
+                       block_kind    = ?,
+                       block_recurrences = ?
+                 WHERE id = ?
+                   AND status IN ('todo', 'running', 'ready', 'review')
+                """,
+                (kind, recurrences, task_id),
+            )
+        else:
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status        = 'blocked',
                        claim_lock    = NULL,
                        claim_expires = NULL,
                        worker_pid    = NULL,
@@ -6266,87 +6308,37 @@ def block_task(
                        block_recurrences = ?
                  WHERE id = ?
                    AND status IN ('running', 'ready')
-                """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (kind, recurrences, task_id) if expected_run_id is None
-                else (kind, recurrences, task_id, int(expected_run_id)),
+                   AND current_run_id = ?
+                """,
+                (kind, recurrences, task_id, int(expected_run_id)),
             )
-            if cur.rowcount != 1:
-                return False
-            run_id = _end_run(
+        if cur.rowcount != 1:
+            return False
+        run_id = _end_run(
+            conn, task_id,
+            outcome="blocked", status="blocked",
+            summary=summary or reason, metadata=metadata,
+        )
+        if run_id is None and (reason or summary or metadata):
+            run_id = _synthesize_ended_run(
                 conn, task_id,
-                outcome="blocked", status="blocked",
+                outcome="blocked",
                 summary=summary or reason, metadata=metadata,
             )
-            if run_id is None and (reason or summary or metadata):
-                run_id = _synthesize_ended_run(
-                    conn, task_id, outcome="blocked", summary=summary or reason, metadata=metadata,
-                )
-            _append_event(
-                conn, task_id, "block_loop_detected",
-                {
-                    "reason": reason,
-                    "kind": kind,
-                    "recurrences": recurrences,
-                    "limit": BLOCK_RECURRENCE_LIMIT,
-                    "source_status": source_status,
-                },
-                run_id=run_id,
-            )
-        else:
-            if expected_run_id is None:
-                cur = conn.execute(
-                    """
-                    UPDATE tasks
-                       SET status        = 'blocked',
-                           claim_lock    = NULL,
-                           claim_expires = NULL,
-                           worker_pid    = NULL,
-                           block_kind    = ?,
-                           block_recurrences = ?
-                     WHERE id = ?
-                       AND status IN ('todo', 'running', 'ready', 'review')
-                    """,
-                    (kind, recurrences, task_id),
-                )
-            else:
-                cur = conn.execute(
-                    """
-                    UPDATE tasks
-                       SET status        = 'blocked',
-                           claim_lock    = NULL,
-                           claim_expires = NULL,
-                           worker_pid    = NULL,
-                           block_kind    = ?,
-                           block_recurrences = ?
-                     WHERE id = ?
-                       AND status IN ('running', 'ready')
-                       AND current_run_id = ?
-                    """,
-                    (kind, recurrences, task_id, int(expected_run_id)),
-                )
-            if cur.rowcount != 1:
-                return False
-            run_id = _end_run(
-                conn, task_id,
-                outcome="blocked", status="blocked",
-                summary=summary or reason, metadata=metadata,
-            )
-            if run_id is None and (reason or summary or metadata):
-                run_id = _synthesize_ended_run(
-                    conn, task_id,
-                    outcome="blocked",
-                    summary=summary or reason, metadata=metadata,
-                )
-            _append_event(
-                conn, task_id, "blocked",
-                {
-                    "reason": reason,
-                    "kind": kind,
-                    "recurrences": recurrences,
-                    "source_status": source_status,
-                },
-                run_id=run_id,
-            )
+        _append_event(
+            conn, task_id, "block_loop_detected" if blocker_payload.get("requires_resolution") else "blocked",
+            {
+                "reason": reason,
+                "kind": kind,
+                "recurrences": recurrences,
+                "limit": BLOCK_RECURRENCE_LIMIT,
+                "source_status": source_status,
+                **blocker_payload,
+            },
+            run_id=run_id,
+        )
+        conn.execute("UPDATE tasks SET blocker_state = ? WHERE id = ?",
+                     (json.dumps(state), task_id))
         _blocked_task = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_blocked",
@@ -6789,12 +6781,28 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "todo" if undone_parents else "ready"
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Resume an inactive hold after dependency and process-ownership checks."""
+def unblock_task(conn: sqlite3.Connection, task_id: str, *,
+                 resolved_blocker_id: Optional[str] = None,
+                 resolution: Optional[str] = None) -> bool:
+    """Resume an inactive hold, optionally recording one blocker resolution.
+
+    Escalated episodes require their active ID and a non-empty resolution note.
+    A plain retry preserves every unresolved counter. Resolution and resumption
+    commit together, and a subsequent report starts a new episode for that ID.
+    """
+    if bool(resolved_blocker_id) != bool(resolution and resolution.strip()):
+        raise ValueError("Supply resolved_blocker_id and a non-empty resolution together")
     with write_txn(conn):
         from hermes_cli.kanban_worker import active_worker_exists
         task = get_task(conn, task_id)
         if not task or task.current_run_id or task.claim_lock or active_worker_exists(conn, task_id):
+            return False
+        state = task.blocker_state or _blocker_state(None, task.block_recurrences)
+        issues = state["issues"]
+        if resolved_blocker_id and (resolved_blocker_id not in issues or issues[resolved_blocker_id].get("resolved")):
+            raise ValueError("resolved_blocker_id must name an unresolved blocker on this task")
+        if (_blocker_requires_resolution(state)
+                and resolved_blocker_id != state["active_id"]):
             return False
         current = conn.execute(
             "SELECT status FROM tasks WHERE id = ?",
@@ -6802,7 +6810,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         ).fetchone()
         resume_status = (
             _resume_status_from_events(conn, task_id)
-            if current and current["status"] in ("blocked", "scheduled")
+            if current and current["status"] in ("blocked", "scheduled", "triage")
             else "ready"
         )
         landing_status = _landing_status_after_parents(conn, task_id)
@@ -6815,11 +6823,22 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
             "consecutive_failures = 0, last_failure_error = NULL "
-            "WHERE id = ? AND status IN ('blocked', 'scheduled')",
-            (new_status, task_id),
+            "WHERE id = ? AND (status IN ('blocked', 'scheduled') OR (status = 'triage' AND ?))",
+            (new_status, task_id, bool(resolved_blocker_id)),
         )
         if cur.rowcount != 1:
             return False
+        if resolved_blocker_id:
+            from agent.redact import redact_sensitive_text
+            note = redact_sensitive_text(resolution.strip(), force=True)
+            issue = issues[resolved_blocker_id]
+            issue.update(resolved=True, resolution=note)
+            conn.execute("UPDATE tasks SET blocker_state = ?, block_recurrences = ? WHERE id = ?",
+                         (json.dumps(state), 0 if resolved_blocker_id == state["active_id"] else task.block_recurrences, task_id))
+            _append_event(conn, task_id, "blocker_resolved", {
+                "blocker_id": resolved_blocker_id, "episode": issue["episode"],
+                "recurrences": issue["count"], "resolution": note,
+            })
         _append_event(
             conn, task_id, "unblocked",
             (
@@ -6839,10 +6858,8 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
     on the new comments. Parent gating preserves dependencies, and the
     transition emits a ``review_reopened`` event.
 
-    Deliberately does NOT touch ``block_recurrences``/``block_kind``: review is
-    not a block, so there is no loop counter to reset. (A stale counter from a
-    genuine block *before* review is left intact — only :func:`complete_task`
-    clears it.) Returns False when the task is missing or not in ``review``.
+    Blocker episodes survive review transitions. Returns False when the task
+    is missing or not in ``review``.
     """
     now = int(time.time())
     with write_txn(conn):

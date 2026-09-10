@@ -87,7 +87,8 @@ def render_event(task, event, board, *, latest_run=None, later_state=False,
         'timed_out': ('needs decision', 'timed out'),
         'progress_warning': ('information', 'worker activity needs inspection'),
         'recovery_required': ('needs decision', 'recovery requires reconciliation'),
-        'block_loop_detected': ('needs decision', 'routed to triage'),
+        'block_loop_detected': ('needs decision', 'held after repeated unresolved blocker'
+                                if payload.get('requires_resolution') else 'routed to triage'),
         'review_requested': ('information', 'ready for review'),
         'changes_requested': ('needs decision', 'review requested changes'),
         'publication_pending': ('publication handoff', 'content accepted, publication pending'),
@@ -103,6 +104,11 @@ def render_event(task, event, board, *, latest_run=None, later_state=False,
         text += '\n' + readable_reason(task.title, 120)
     if reason:
         text += '\n' + reason
+    if payload.get('blocker_id'):
+        text += '\nBlocker: ' + readable_reason(payload['blocker_id'], 128)
+        text += f" | episode {payload.get('episode', '?')} | reports {payload.get('recurrences', '?')}"
+    if payload.get('requires_resolution'):
+        text += '\nAction: resolve this condition and record its blocker ID and resolution before resuming.'
     if event.kind == 'progress_warning':
         text += f'\nRecorded quiet interval: {readable_reason(str(payload.get("quiet_seconds", "unknown")), 24)}s'
     if event.kind == 'timed_out':

@@ -70,6 +70,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "task_scope": t.task_scope,
         "execution_authority": t.execution_authority,
         "publication": t.publication,
+        "blocker_state": t.blocker_state,
         "repository_identity": t.repository_identity,
         "approved_base": t.approved_base,
         "workspace_kind": t.workspace_kind,
@@ -700,18 +701,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
 
     p_block = sub.add_parser("block", help="Hold tasks for operator resumption, stopping verified active workers")
     p_block.add_argument("task_id")
+    p_block.add_argument("--blocker-id", help="Stable non-secret condition ID within this task")
     p_block.add_argument("reason", nargs="*", help="Reason (also appended as a comment)")
     p_block.add_argument("--ids", nargs="+", default=None,
                          help="Additional task ids to block with the same reason (bulk mode)")
     p_block.add_argument(
         "--kind", default=None, choices=sorted(kb.VALID_BLOCK_KINDS),
-        help=(
-            "Typed block reason. 'dependency' waits in todo (auto-promoted "
-            "when parents finish, no human); 'needs_input'/'capability' go to "
-            "blocked for a human; 'transient' marks a maybe-flaky failure. "
-            "Repeated same-kind re-blocks after unblock route the task to "
-            "triage to break unblock loops. Omit for a generic block."
-        ),
+        help="Block category. Dependency waits in todo. Other categories hold for operator input.",
     )
 
     p_schedule = sub.add_parser("schedule", help="Park tasks in Scheduled, stopping verified active workers")
@@ -729,6 +725,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         default=None,
         help="Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons.",
     )
+    p_unblock.add_argument("--resolved-blocker-id", help="Condition ID actually resolved")
+    p_unblock.add_argument("--resolution", help="Evidence of resolution, required with the resolved ID")
     p_unblock.add_argument("task_ids", nargs="+")
 
     p_request_review = sub.add_parser(
@@ -2018,6 +2016,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print(f"Comments ({len(comments)}):")
         for c in comments:
             print(f"  [{_fmt_ts(c.created_at)}] {c.author}: {c.body}")
+    if task.blocker_state and task.blocker_state["issues"]:
+        print("Blockers: " + json.dumps(task.blocker_state))
     if events:
         print()
         print(f"Events ({len(events)}):")
@@ -2561,25 +2561,21 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 tid,
                 reason=reason,
                 kind=kind,
+                blocker_id=getattr(args, "blocker_id", None),
                 expected_run_id=_worker_run_id_for(tid),
             ):
                 failed.append(tid)
                 print(f"cannot block {tid}", file=sys.stderr)
             else:
-                # Report where the task actually landed — dependency blocks go
-                # to todo, and a tripped unblock-loop breaker routes to triage.
                 landed = kb.get_task(conn, tid)
                 where = landed.status if landed else "blocked"
                 suffix = f": {reason}" if reason else ""
                 if where == "todo":
                     print(f"{tid} → todo (dependency wait){suffix}")
-                elif where == "triage":
-                    print(
-                        f"{tid} → triage (unblock loop detected — needs a "
-                        f"human decision){suffix}"
-                    )
                 else:
                     print(f"Blocked {tid}{suffix}")
+                if landed and landed.blocker_state and landed.blocker_state["issues"]:
+                    print("Blockers: " + json.dumps(landed.blocker_state))
     return 0 if not failed else 1
 
 
@@ -2619,9 +2615,11 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
         for tid in ids:
             if reason:
                 kb.add_comment(conn, tid, author, f"UNBLOCK: {reason}")
-            if not kb.unblock_task(conn, tid):
+            if not kb.unblock_task(conn, tid,
+                                   resolved_blocker_id=getattr(args, "resolved_blocker_id", None),
+                                   resolution=getattr(args, "resolution", None)):
                 failed.append(tid)
-                print(f"cannot unblock {tid} (not blocked/scheduled?)", file=sys.stderr)
+                print(f"cannot unblock {tid}: inspect its state and unresolved blocker resolution requirement", file=sys.stderr)
             else:
                 print(f"Unblocked {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1

@@ -302,7 +302,8 @@ def test_worker_block_recurrence_still_escalates(board):
         assert kb.block_task(board, tid, kind='capability', expected_run_id=worker.current_run_id)
         if i < kb.BLOCK_RECURRENCE_LIMIT - 1:
             assert kb.unblock_task(board, tid)
-    assert kb.get_task(board, tid).status == 'triage'
+    assert kb.get_task(board, tid).status == 'blocked'
+    assert not kb.unblock_task(board, tid)
 
 
 # Negative-case cleanup must signal the captured child after it is reparented.
