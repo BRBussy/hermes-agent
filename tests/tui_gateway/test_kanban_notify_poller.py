@@ -30,7 +30,7 @@ def _session(key: str = SESSION_KEY) -> dict:
 def _create_subscribed_task(*, chat_id: str = SESSION_KEY, platform: str = "tui"):
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="notify tui", assignee="worker")
+        tid = kb.create_task(conn, title="notify tui", assignee="worker", execution_authority="Isolated notification fixture")
         kb.add_notify_sub(conn, task_id=tid, platform=platform, chat_id=chat_id)
         return tid
     finally:
@@ -40,7 +40,7 @@ def _create_subscribed_task(*, chat_id: str = SESSION_KEY, platform: str = "tui"
 def _complete(tid: str, summary: str = "all done") -> None:
     conn = kb.connect()
     try:
-        kb.complete_task(conn, tid, summary=summary)
+        assert kb.complete_task(conn, tid, summary=summary)
     finally:
         conn.close()
 
@@ -95,9 +95,8 @@ class TestCollectKanbanNotifications:
 
         reopened = _collect_kanban_notifications(_session())
 
-        assert len(reopened) == 2
-        assert "ready" in reopened[0]
-        assert "review corrections" in reopened[1]
+        assert len(reopened) == 1
+        assert "review corrections" in reopened[0]
         rows = _sub_rows(tid)
         assert len(rows) == 1
         assert rows[0]["chat_id"] == SESSION_KEY
@@ -234,31 +233,31 @@ class TestCollectKanbanNotifications:
 
 class TestFormatKanbanEventText:
     SUB = {"task_id": "t_abc123"}
-    TASK = SimpleNamespace(title="build the thing", assignee="worker", result=None)
+    TASK = SimpleNamespace(title="build the thing", assignee="worker", result=None, status="blocked", publication=None, current_run_id=None)
 
     def test_silent_kinds_return_none(self):
         for kind in ("archived", "unblocked"):
-            ev = SimpleNamespace(kind=kind, payload={})
+            ev = SimpleNamespace(id=1, task_id="t_abc123", run_id=None, kind=kind, payload={})
             assert _format_kanban_event_text(self.SUB, self.TASK, ev, "main") is None
 
     def test_blocked_includes_reason(self):
-        ev = SimpleNamespace(kind="blocked", payload={"reason": "needs creds"})
+        ev = SimpleNamespace(id=1, task_id="t_abc123", run_id=None, kind="blocked", payload={"reason": "needs creds"})
         text = _format_kanban_event_text(self.SUB, self.TASK, ev, "main")
         assert "t_abc123" in text
         assert "blocked" in text
         assert "needs creds" in text
         assert "[main]" in text
-        assert "@worker" in text
+        assert "run not recorded" in text
 
     def test_completed_prefers_payload_summary(self):
-        ev = SimpleNamespace(kind="completed", payload={"summary": "first line\nsecond"})
+        ev = SimpleNamespace(id=1, task_id="t_abc123", run_id=None, kind="completed", payload={"summary": "first line\nsecond"})
         text = _format_kanban_event_text(self.SUB, self.TASK, ev, "")
         assert "done" in text
         assert "first line" in text
-        assert "second" not in text
+        assert "first line second" in text
 
     def test_timed_out_with_bad_payload_does_not_raise(self):
-        ev = SimpleNamespace(kind="timed_out", payload={"limit_seconds": "not-a-number"})
+        ev = SimpleNamespace(id=1, task_id="t_abc123", run_id=None, kind="timed_out", payload={"limit_seconds": "not-a-number"})
         text = _format_kanban_event_text(self.SUB, self.TASK, ev, "")
         assert "timed out" in text
 

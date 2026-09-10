@@ -11897,14 +11897,8 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
     return (evt_sid, evt_type)
 
 
-# Mirror gateway/kanban_watchers.py TERMINAL_KINDS: claim silent kinds too so
-# the cursor advances past them and they can't wedge a later completed/blocked
-# event behind an unclaimed row.
-_KANBAN_NOTIFY_KINDS = (
-    "completed", "blocked", "gave_up", "crashed", "timed_out",
-    "status", "archived", "unblocked",
-)
-_KANBAN_SILENT_KINDS = frozenset({"archived", "unblocked"})
+from hermes_cli.kanban_notifications import NOTIFY_KINDS as _KANBAN_NOTIFY_KINDS
+
 _KANBAN_POLL_SECONDS = 5.0
 _LOOP_POLL_SECONDS = 5.0
 
@@ -12004,49 +11998,10 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
 
 
 def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[str]:
-    """Single-line notification text for one kanban event.
+    from hermes_cli.kanban_notifications import render_event
 
-    Wording mirrors the gateway notifier (gateway/kanban_watchers.py) so a
-    task completion reads the same in the TUI as it does on Telegram.
-    Returns None for kinds that are claimed but intentionally silent.
-    """
-    kind = getattr(ev, "kind", "")
-    if not kind or kind in _KANBAN_SILENT_KINDS:
-        return None
-    task_id = sub.get("task_id", "")
-    title = (getattr(task, "title", None) or task_id)[:120]
-    board_tag = f"[{board_slug}] " if board_slug else ""
-    who = getattr(task, "assignee", None) or ""
-    tag = f"@{who} " if who else ""
-    payload = getattr(ev, "payload", None) or {}
-    if kind == "completed":
-        handoff = ""
-        summary = payload.get("summary")
-        if summary:
-            lines = str(summary).strip().splitlines()
-            handoff = f"\n{lines[0][:200]}" if lines else ""
-        elif getattr(task, "result", None):
-            lines = str(task.result).strip().splitlines()
-            handoff = f"\n{lines[0][:160]}" if lines else ""
-        return f"✔ {board_tag}{tag}Kanban {task_id} done — {title}{handoff}"
-    if kind == "blocked":
-        reason = f": {str(payload.get('reason'))[:160]}" if payload.get("reason") else ""
-        return f"⏸ {board_tag}{tag}Kanban {task_id} blocked{reason}"
-    if kind == "gave_up":
-        err = f"\n{str(payload.get('error'))[:200]}" if payload.get("error") else ""
-        return f"✖ {board_tag}{tag}Kanban {task_id} gave up after repeated spawn failures{err}"
-    if kind == "crashed":
-        return f"✖ {board_tag}{tag}Kanban {task_id} worker crashed (pid gone); dispatcher will retry"
-    if kind == "timed_out":
-        limit = 0
-        try:
-            limit = int(payload.get("limit_seconds") or 0)
-        except (TypeError, ValueError):
-            pass
-        return f"⏱ {board_tag}{tag}Kanban {task_id} timed out (max_runtime={limit}s); will retry"
-    if kind == "status":
-        return f"🔄 {board_tag}{tag}Kanban {task_id} → {payload.get('status') or ''}"
-    return None
+    notification = render_event(task, ev, board_slug)
+    return notification["text"] if notification else None
 
 
 def _collect_kanban_notifications(session: dict) -> list:
@@ -12058,8 +12013,7 @@ def _collect_kanban_notifications(session: dict) -> list:
     can't deliver those — there is no "tui" messaging adapter — so this
     poller is the delivery path for them (issue #59890). Uses the same
     atomic cursor-claim (``claim_unseen_events_for_sub``) as the gateway
-    notifier, so a subscription is delivered exactly once even if a gateway
-    and a TUI poll the same board DB.
+    notifier. A cursor claim coordinates pollers but does not prove client receipt.
 
     Returns the list of formatted notification texts (may be empty).
     """
@@ -12135,9 +12089,17 @@ def _collect_kanban_notifications(session: dict) -> list:
                     continue
                 task = _kb.get_task(conn, sub["task_id"])
                 for ev in events:
-                    text = _format_kanban_event_text(sub, task, ev, slug)
-                    if text:
-                        texts.append(text)
+                    from hermes_cli.kanban_notifications import notification_for_event
+                    try:
+                        notification = notification_for_event(conn, ev, slug)
+                    except Exception:
+                        _kb.rewind_notify_cursor(conn, task_id=sub["task_id"],
+                            platform=sub["platform"], chat_id=sub["chat_id"],
+                            thread_id=sub.get("thread_id") or "",
+                            claimed_cursor=_new, old_cursor=_old)
+                        raise
+                    if notification:
+                        texts.append(notification["text"])
                 # Unsubscribe only on archive. ``done`` is reversible in
                 # review/controller flows, so retaining the subscription lets
                 # a later reopen notify the same originating TUI/Desktop

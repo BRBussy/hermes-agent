@@ -1,52 +1,19 @@
-"""Kanban board watcher methods for GatewayRunner.
-
-Extracted verbatim from ``gateway/run.py`` (god-file decomposition Phase 3).
-These are the background-loop methods that subscribe to kanban boards, deliver
-notifications/artifacts, and drive the multi-agent dispatcher. They use only
-``self`` state, so they live on a mixin that ``GatewayRunner`` inherits — the
-``self._kanban_*`` call sites resolve identically via the MRO, making this a
-behavior-neutral move that lifts ~1,000 LOC out of run.py.
-"""
+"""Kanban delivery and dispatcher loops for GatewayRunner."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
 import os
-import re
 import sqlite3
 import time
 from contextvars import Context
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from agent.i18n import t
-
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
-
-
-_LOCAL_PATH_RE = re.compile(
-    r"(?<![\w:/])(?:/(?:Users|home|private|tmp|var|etc|workspace)/[^\s,;]+|"
-    r"[A-Za-z]:\\[^\s,;]+)"
-)
-
-
-def _safe_review_reason(value: Any, limit: int = 160) -> str:
-    """Return a mobile-friendly review reason safe for external delivery."""
-    from agent.redact import redact_sensitive_text
-
-    reason = redact_sensitive_text(
-        "" if value is None else str(value),
-        force=True,
-        redact_url_credentials=True,
-    )
-    reason = _LOCAL_PATH_RE.sub("[local path]", reason)
-    reason = " ".join(reason.split())
-    if len(reason) > limit:
-        reason = reason[: limit - 1].rstrip() + "…"
-    return reason
 
 
 def _resolve_auto_decompose_settings(
@@ -263,7 +230,8 @@ class GatewayKanbanWatchersMixin:
         # but is not a block (see kanban_db.request_review); the task is not
         # archived, so the subscription stays alive and later review
         # cycles keep notifying.
-        TERMINAL_KINDS = ("progress_warning", "recovery_required", "completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested", "publication_pending")
+        from hermes_cli.kanban_notifications import NOTIFY_KINDS, notification_for_event
+        TERMINAL_KINDS = NOTIFY_KINDS
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
         # so removing its subscription would silence a later reopen. We used
@@ -552,8 +520,6 @@ class GatewayKanbanWatchersMixin:
                             board_slug,
                         )
                         continue
-                    title = (task.title if task else sub["task_id"])[:120]
-                    board_tag = f"[{board_slug}] " if board_slug else ""
                     # Per-subscription failure-counter key. Hoisted out of the
                     # event loop: the wake self-post path (in the loop's
                     # ``else`` clause) needs it even when every event in the
@@ -565,149 +531,25 @@ class GatewayKanbanWatchersMixin:
                     mode = sub.get("delivery_mode") or "notify"
                     wake_agent = mode in ("notify+wake", "wake")
                     send_passive = mode != "wake"
-                    # Worker handoff carried into the synthetic wake turn below
-                    # (#70752): without it the woken creator only sees
-                    # "Task X completed" and re-decomposes work that already
-                    # exists on the board.
-                    wake_handoff = ""
-                    wake_review_detail = ""
-                    wake_publication_detail = ""
+                    delivered_notifications = []
                     for ev in d["events"]:
                         kind = ev.kind
-                        # Identity prefix: attribute terminal pings to the
-                        # worker that did the work. Makes fleets (where one
-                        # chat subscribes to many tasks) legible at a glance.
-                        who = (task.assignee if task and task.assignee else None)
-                        tag = f"@{who} " if who else ""
-                        if kind == "completed":
-                            # Prefer the run's summary (the worker's
-                            # intentional human-facing handoff, carried
-                            # in the event payload), then fall back to
-                            # task.result for legacy rows written before
-                            # runs shipped.
-                            handoff = ""
-                            payload_summary = None
-                            if ev.payload and ev.payload.get("summary"):
-                                payload_summary = str(ev.payload["summary"])
-                            if payload_summary:
-                                lines = payload_summary.strip().splitlines()
-                                h = lines[0][:200] if lines else payload_summary[:200]
-                                handoff = f"\n{h}"
-                                wake_handoff = h
-                            elif task and task.result:
-                                lines = task.result.strip().splitlines()
-                                r = lines[0][:160] if lines else task.result[:160]
-                                handoff = f"\n{r}"
-                                wake_handoff = r
-                            msg = (
-                                f"✔ {board_tag}{tag}Kanban {sub['task_id']} done"
-                                f" — {title}{handoff}"
+                        def _interpret():
+                            with _kb.connect_closing(board=board_slug) as current_conn:
+                                return notification_for_event(current_conn, ev, board_slug)
+                        try:
+                            notification = await asyncio.to_thread(_interpret)
+                        except Exception:
+                            await _to_thread_process_service(
+                                self._kanban_rewind, sub, d["cursor"],
+                                d.get("old_cursor", 0), board_slug,
                             )
-                        elif kind == "blocked":
-                            reason = ""
-                            if ev.payload and ev.payload.get("reason"):
-                                reason = f": {str(ev.payload['reason'])[:160]}"
-                            msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
-                        elif kind == "progress_warning":
-                            quiet = (ev.payload or {}).get('quiet_seconds', '?')
-                            msg = f"Kanban {sub['task_id']} has a verified live worker with no recorded runtime activity for {quiet}s. Inspect the attempt before recovery."
-                        elif kind == "recovery_required":
-                            msg = f"Kanban {sub['task_id']} stopped. Its worktree is retained. Reconcile publication receipts before authorising recovery."
-                        elif kind == "gave_up":
-                            err = ""
-                            if ev.payload and ev.payload.get("error"):
-                                err = f"\n{str(ev.payload['error'])[:200]}"
-                            msg = (
-                                f"✖ {board_tag}{tag}Kanban {sub['task_id']} gave up "
-                                f"after repeated spawn failures{err}"
-                            )
-                        elif kind == "crashed":
-                            msg = (
-                                f"✖ {board_tag}{tag}Kanban {sub['task_id']} worker crashed "
-                                f"(process exit detected). Inspect the attempt and recovery requirements."
-                            )
-                        elif kind == "timed_out":
-                            limit = 0
-                            if ev.payload and ev.payload.get("limit_seconds"):
-                                limit = int(ev.payload["limit_seconds"])
-                            msg = (
-                                f"⏱ {board_tag}{tag}Kanban {sub['task_id']} timed out "
-                                f"(max_runtime={limit}s). Inspect the attempt and recovery requirements."
-                            )
-                        elif kind == "status":
-                            new_status = ""
-                            if ev.payload and ev.payload.get("status"):
-                                new_status = str(ev.payload["status"])
-                            msg = f"🔄 {board_tag}{tag}Kanban {sub['task_id']} → {new_status}"
-                        elif kind == "review_requested":
-                            # Implementation complete; task moved to the
-                            # first-class review lane. Wake the origin thread.
-                            handoff = ""
-                            if ev.payload and ev.payload.get("summary"):
-                                summary = str(ev.payload["summary"])
-                                handoff = f"\n{summary[:200]}"
-                                # Carry the worker's handoff into the wake turn
-                                # like ``completed`` does: a reviewer woken with
-                                # a bare "ready for review" has to re-read the
-                                # board to learn what was implemented.
-                                lines = summary.strip().splitlines()
-                                wake_handoff = (
-                                    lines[0][:200] if lines else summary[:200]
-                                )
-                            msg = (
-                                f"👀 {board_tag}{tag}Kanban {sub['task_id']} ready for review"
-                                f" — {title}{handoff}"
-                            )
-                        elif kind == "publication_pending":
-                            payload = ev.payload or {}
-                            detail = _safe_review_reason(payload.get("summary"))
-                            msg = (f"✓ {board_tag}Kanban {sub['task_id']} content accepted, "
-                                   f"publication awaiting authority: {detail}")
-                            wake_publication_detail = "Content accepted. Record scoped publication authority and retain fresh published-state review. " + detail
-                        elif kind == "changes_requested":
-                            payload = ev.payload or {}
-                            reason = _safe_review_reason(payload.get("reason"))
-                            reviewer = _safe_review_reason(payload.get("reviewer"), 48)
-                            implementer = _safe_review_reason(payload.get("implementer"), 48)
-                            reason_text = reason or "reviewer feedback requires changes"
-                            provenance = ""
-                            if reviewer:
-                                provenance += f" — reviewer @{reviewer}"
-                            if implementer:
-                                provenance += f" → implementer @{implementer}"
-                            msg = (
-                                f"🛑 {board_tag}Kanban {sub['task_id']} review requested "
-                                f"changes/BLOCK: {reason_text}{provenance}"
-                            )
-                            wake_review_detail = reason_text
-                        elif kind == "block_loop_detected":
-                            # A task re-blocked for the same cause past the
-                            # recurrence limit and was routed to `triage` for a
-                            # human decision. This is the ONE transition that
-                            # exists to force human attention, yet it emits no
-                            # `blocked`/`status` event — so before adding it to
-                            # TERMINAL_KINDS it produced zero notification and
-                            # the task stalled in triage silently. Ping loudly.
-                            reason = ""
-                            recurrences = None
-                            if ev.payload:
-                                if ev.payload.get("reason"):
-                                    reason = f": {str(ev.payload['reason'])[:160]}"
-                                recurrences = ev.payload.get("recurrences")
-                            rc = f" (blocked {recurrences}x for the same cause)" if recurrences else ""
-                            msg = (
-                                f"🛑 {board_tag}{tag}Kanban {sub['task_id']} routed to TRIAGE"
-                                f" — needs a human decision{rc}{reason}"
-                            )
-                        else:
-                            # archived / unblocked are claimed by TERMINAL_KINDS
-                            # (so the cursor advances past them and they can't
-                            # wedge a later completed/blocked event behind an
-                            # unclaimed row) but are intentionally SILENT: an
-                            # archive needs no user ping, and unblocked is an
-                            # internal transition. They are also excluded from
-                            # _WAKE_KINDS below, so they never wake the creator.
+                            logger.warning("Kanban notification state lookup failed for %s", sub["task_id"])
+                            break
+                        if notification is None:
                             continue
+                        msg = notification["text"]
+                        delivered_notifications.append(notification)
                         delivery_metadata = sub.get("delivery_metadata")
                         metadata: dict[str, Any] = (
                             dict(delivery_metadata)
@@ -771,30 +613,22 @@ class GatewayKanbanWatchersMixin:
                                 "kanban notifier: delivered %s event for %s to %s/%s on board %s",
                                 kind, sub["task_id"], platform_str, sub["chat_id"], board_slug,
                             )
-                            # After delivering the text notification, surface
-                            # any artifact paths the worker referenced in
-                            # ``kanban_complete(summary=..., artifacts=[...])``
-                            # (or the legacy ``result`` field) as native
-                            # uploads. ``extract_local_files`` finds bare
-                            # absolute paths in the summary;
-                            # ``send_document`` / ``send_image_file`` uploads
-                            # them. Only fires on the ``completed`` event so
-                            # we never spam attachments on retries.
-                            if kind == "completed":
+                            # Historical paths cannot establish current artifact availability.
+                            if kind == "completed" and not notification["historical"]:
                                 try:
                                     await self._deliver_kanban_artifacts(
                                         adapter=adapter,
                                         chat_id=sub["chat_id"],
                                         metadata=metadata,
-                                        event_payload=getattr(ev, "payload", None),
-                                        task=task,
+                                        event_payload={"artifacts": notification["artifact_paths"]},
+                                        task=None,
                                     )
                                 except Exception as art_exc:
                                     logger.debug(
                                         "kanban notifier: artifact delivery for %s failed: %s",
                                         sub["task_id"], art_exc,
                                     )
-                            # Reset the failure counter on success.
+                            d["old_cursor"] = ev.id
                             sub_fail_counts.pop(sub_key, None)
                         except Exception as exc:
                             fails = sub_fail_counts.get(sub_key, 0) + 1
@@ -843,23 +677,9 @@ class GatewayKanbanWatchersMixin:
                         #   claim exactly like a failed send() above, so the
                         #   next tick retries.
                         task_terminal = task and task.status == "archived"
-                        # Kinds that hand a decision back to the origin, so the
-                        # origin has to take a turn. ``review_requested`` (the
-                        # implementation is done and waits for a reviewer),
-                        # ``changes_requested`` (a reviewer BLOCKed and work
-                        # returns to the implementer) and ``block_loop_detected``
-                        # (routed to triage) belong here for the same reason
-                        # ``blocked`` does. ``status`` / ``archived`` /
-                        # ``unblocked`` stay out: bookkeeping.
-                        _WAKE_KINDS = (
-                            "completed", "gave_up", "crashed", "timed_out",
-                            "blocked", "review_requested", "changes_requested", "publication_pending",
-                            "block_loop_detected",
-                        )
                         _wake_kinds = (
-                            {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
-                            if wake_agent
-                            else set()
+                            {item["event_kind"] for item in delivered_notifications
+                             if item["event_kind"] != "progress_warning"} if wake_agent else set()
                         )
                         from gateway.wake import adapter_supports_push as _adapter_push_ok
 
@@ -884,46 +704,14 @@ class GatewayKanbanWatchersMixin:
                                     or ""
                                 )
                         if _wake_kinds:
-                            _title = (task.title if task else sub["task_id"])[:120]
-                            _assignee = task.assignee if task else ""
-                            _parts = []
-                            if "completed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.completed"))
-                            if "gave_up" in _wake_kinds: _parts.append(t("gateway.kanban.wake.gave_up"))
-                            if "crashed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.crashed"))
-                            if "timed_out" in _wake_kinds: _parts.append(t("gateway.kanban.wake.timed_out"))
-                            if "blocked" in _wake_kinds: _parts.append(t("gateway.kanban.wake.blocked"))
-                            if "review_requested" in _wake_kinds: _parts.append(t("gateway.kanban.wake.review_requested"))
-                            if "changes_requested" in _wake_kinds: _parts.append(t("gateway.kanban.wake.changes_requested"))
-                            if "publication_pending" in _wake_kinds: _parts.append("content accepted with publication pending")
-                            if "block_loop_detected" in _wake_kinds: _parts.append(t("gateway.kanban.wake.block_loop_detected"))
-                            _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
-                            _synth = t(
-                                "gateway.kanban.wake.message",
-                                task_id=sub["task_id"],
-                                status=_status,
-                                title=_title,
-                                assignee=_assignee,
-                                board=board_slug,
+                            _synth = "Automatic Kanban notification.\n" + "\n\n".join(
+                                item["text"] for item in delivered_notifications
                             )
-                            # Graph-safe wake turn (#70752): carry the worker's
-                            # completion handoff into the synthetic turn and
-                            # label it as an automatic notification so the woken
-                            # creator inspects the board instead of
-                            # re-decomposing work that already exists.
-                            if wake_handoff:
-                                _synth += "\n" + t(
-                                    "gateway.kanban.wake.handoff",
-                                    summary=wake_handoff,
-                                )
-                            if wake_review_detail:
-                                _synth += "\n" + t(
-                                    "gateway.kanban.wake.review_detail",
-                                    reason=wake_review_detail,
-                                )
-                            if wake_publication_detail:
-                                _synth += "\n" + wake_publication_detail
-                            _synth += "\n\n" + t(
-                                "gateway.kanban.wake.guidance"
+                            _synth += (
+                                "\n\nInspect the existing card and its current review run before acting. "
+                                "Treat earlier-event and earlier-attempt notices as history. "
+                                "Report only meaningful changes or decisions, and do not create a duplicate task. "
+                                "Event claims and cursor advancement are not proof of operator receipt."
                             )
 
                         if not _is_push_adapter and _wake_kinds and _session_key:

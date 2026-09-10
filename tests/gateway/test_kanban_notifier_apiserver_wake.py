@@ -76,10 +76,10 @@ def _create_completed_subscription(platform, chat_id, session_id=None):
     conn = kb.connect()
     try:
         tid = kb.create_task(
-            conn, title="notify once", assignee="worker", session_id=session_id,
+            conn, execution_authority="Isolated notification fixture", title="notify once", assignee="worker", session_id=session_id,
         )
         kb.add_notify_sub(conn, task_id=tid, platform=platform, chat_id=chat_id)
-        kb.complete_task(conn, tid, summary="done once")
+        assert kb.complete_task(conn, tid, summary="done once")
         return tid
     finally:
         conn.close()
@@ -134,8 +134,8 @@ def test_apiserver_sub_wakes_subscription_destination_via_self_post(tmp_path, mo
     # worker's completion handoff and the don't-recreate guidance so a
     # woken orchestrator doesn't re-decompose existing work.
     assert "done once" in wake_text, "creator wake must carry the worker handoff"
-    assert "not a request to decompose" in wake_text.lower()
-    assert "do not recreate" in wake_text.lower()
+    assert "Inspect the existing card" in wake_text
+    assert "do not create a duplicate task" in wake_text.lower()
     # The wake self-post IS the delivery on this path (no separate text-ping
     # fallback is attempted for stateless api_server subs) — cursor advances
     # once the wake succeeds.
@@ -152,6 +152,7 @@ def test_apiserver_subscriptions_have_independent_wake_destinations(
         tid = kb.create_task(
             conn,
             title="notify both",
+            execution_authority="Isolated notification fixture",
             assignee="worker",
             session_id="worker-session",
         )
@@ -162,7 +163,7 @@ def test_apiserver_subscriptions_have_independent_wake_destinations(
                 platform="api_server",
                 chat_id=chat_id,
             )
-        kb.complete_task(conn, tid, summary="done once")
+        assert kb.complete_task(conn, tid, summary="done once")
     finally:
         conn.close()
 

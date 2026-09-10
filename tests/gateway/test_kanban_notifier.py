@@ -426,9 +426,7 @@ def test_notifier_subscription_survives_done_reopen_until_archive(
     runner._active_profile_name = lambda: "reviewer"
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
-    # The reopen status and second completion each deliver once, while only
-    # completion wakes the exact original session/thread.
-    assert len(adapter.sent) == 3
+    assert len(adapter.sent) == 2
     assert len(adapter.handled) == 2
     assert all(item["chat_id"] == "origin-chat" for item in adapter.sent)
     assert adapter.handled[-1].source.thread_id == "origin-thread"
@@ -449,7 +447,7 @@ def test_notifier_subscription_survives_done_reopen_until_archive(
 
     # Archive itself is intentionally silent, but consumes its event and
     # removes the subscription so no later historical event can replay.
-    assert len(adapter.sent) == 3
+    assert len(adapter.sent) == 2
     assert len(adapter.handled) == 2
     conn = kb.connect()
     try:
@@ -609,7 +607,7 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
 
     assert len(adapter.sent) == 1, "block_loop_detected must produce a notification"
     text = adapter.sent[0]["text"]
-    assert "TRIAGE" in text
+    assert "routed to triage" in text and "Needs decision" in text
     assert tid in text
     assert "needs credentials" in text
     # Cursor advanced: the event is claimed and not re-delivered.

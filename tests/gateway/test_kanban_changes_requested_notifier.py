@@ -103,15 +103,16 @@ def test_changes_requested_notify_wake_is_actionable_and_exactly_routed(tmp_path
 
     assert len(adapter.sent) == 1
     text = adapter.sent[0]["text"]
-    assert text.startswith(f"🛑 [default] Kanban {task_id} review requested changes/BLOCK: Tests need updates")
-    assert "reviewer @claude-qa → implementer @codex-cua" in text
+    assert f"[default] Kanban {task_id}: review requested changes" in text
+    assert "Needs decision" in text and "Tests need updates" in text
+    assert "reviewer @claude-qa, implementer @codex-cua" in text
     assert adapter.sent[0]["metadata"]["thread_id"] == "topic-7"
     assert len(adapter.handled) == 1
     wake = adapter.handled[0]
     assert wake.source.chat_id == "chat-1"
     assert wake.source.chat_type == "thread"
     assert wake.source.thread_id == "topic-7"
-    assert "implementation is not approved" in wake.text
+    assert "Needs decision" in wake.text
     assert "Inspect the existing card and its current review run" in wake.text
     assert "do not create a duplicate task" in wake.text
     assert wake.text.count("do not create a duplicate task") == 1
@@ -179,4 +180,4 @@ def test_changes_requested_reason_is_redacted_path_safe_and_truncated(tmp_path, 
     assert "/Users/alice" not in text
     assert "abcdefghijklmnopqrstuvwxyz" not in text
     assert "[local path]" in text
-    assert "… — reviewer @claude-qa" in text
+    assert "...\nreviewer @claude-qa" in text

@@ -1,31 +1,4 @@
-/**
- * Native kanban terminal-event notification (completion, blocker, failure).
- *
- * No maintained exact-fit OSS exists and the SDK
- * has no kanban event door, so this module rides the kanban plugin's EXISTING
- * /events socket (api.ts onEventsFrame). No new WebSocket, no new process,
- * no DB, no auth, no persistence — cursor is an in-memory per-board high-water
- * mark. Notifies on the same terminal kinds the gateway watcher pings
- * (gateway/kanban_watchers.py): 'completed' (kanban_db.complete_task —
- * payload: summary + artifacts), 'blocked' (payload: reason), 'gave_up'
- * (payload: error), 'crashed', 'timed_out', and 'block_loop_detected'
- * (payload: reason — the routed-to-triage human handoff).
- *
- * Two delivery doors, complementary by design:
- *  - `host.notify` — the in-app toast, covers the foreground case;
- *  - `ctx.os.notify` (when bound) — the native OS notification, which the
- *    desktop shell fires only while the user is AWAY from Hermes. This is the
- *    door that covers "walked away and the worker hit a blocker".
- *
- * Cursor contract: first observation of a board baselines
- * seen[board] = GET /board latest_event_id (MAX task_events.id for that
- * board). Events id <= seen are historical/replay — never notified, no
- * cursor change. id > seen advances cursor for EVERY kind; only terminal
- * kinds emit. Reconnect replays from 0; cursor filters. Board switch never
- * mixes cursors; returning reuses prior cursor (never reset to current MAX).
- * Fail-closed: while a board's baseline is unknown, no event can be
- * classified so none is notified. Empty slug ('') suppressed.
- */
+/** Board event notices consume the backend state snapshot when available. */
 
 import { host, type PluginOs, type PluginRestOptions, type PluginTranslate } from '@hermes/plugin-sdk'
 
@@ -38,14 +11,17 @@ export interface CompletionEvent {
   task_id?: string
   kind?: string
   payload?: Record<string, unknown> | null
+  notification?: { text: string; category: string; historical: boolean } | null
 }
 
-type ToastKind = 'error' | 'success' | 'warning'
+type ToastKind = 'error' | 'success' | 'warning' | 'info'
 
-/** Terminal kinds → toast severity + i18n title key. Mirrors the gateway
- *  watcher's ping set (gateway/kanban_watchers.py) minus the intentionally
- *  silent kinds (status/archived/unblocked, which only advance the cursor). */
 const TERMINAL_NOTIFY = new Map<string, { titleKey: string; toast: ToastKind }>([
+  ['publication_pending', { titleKey: 'notify.completedTitle', toast: 'success' }],
+  ['review_requested', { titleKey: 'notify.completedTitle', toast: 'success' }],
+  ['changes_requested', { titleKey: 'notify.blockedTitle', toast: 'warning' }],
+  ['recovery_required', { titleKey: 'notify.blockedTitle', toast: 'warning' }],
+  ['progress_warning', { titleKey: 'notify.blockedTitle', toast: 'warning' }],
   ['blocked', { titleKey: 'notify.blockedTitle', toast: 'warning' }],
   ['block_loop_detected', { titleKey: 'notify.blockLoopTitle', toast: 'warning' }],
   ['completed', { titleKey: 'notify.completedTitle', toast: 'success' }],
@@ -111,66 +87,21 @@ async function ensureBaseline(slug: string): Promise<void> {
   }
 }
 
-function trimmed(value: unknown): string {
-  return typeof value === 'string' ? value.trim() : ''
-}
-
-/** The human handoff carried in the event payload, per kind (mirrors the
- *  payload contract the gateway watcher reads). */
-function bodyFor(kind: string, ev: CompletionEvent): string {
-  const payload = ev.payload
-
-  if (kind === 'completed') {
-    return trimmed(payload?.summary)
-  }
-
-  if (kind === 'blocked' || kind === 'block_loop_detected') {
-    return trimmed(payload?.reason)
-  }
-
-  if (kind === 'gave_up') {
-    return trimmed(payload?.error)
-  }
-
-  return ''
-}
-
-function notifyOne(kind: string, spec: { titleKey: string; toast: ToastKind }, ev: CompletionEvent): void {
+function notifyOne(slug: string, spec: { titleKey: string; toast: ToastKind }, ev: CompletionEvent): void {
   const taskId = (ev.task_id ?? '').trim()
-  const body = bodyFor(kind, ev)
-
-  const artifacts =
-    kind === 'completed' && Array.isArray(ev.payload?.artifacts)
-      ? (ev.payload!.artifacts as unknown[])
-          .filter((a): a is string => typeof a === 'string' && a.trim().length > 0)
-          .map(a => a.trim())
-      : []
-
-  const artifactText =
-    artifacts.length === 1
-      ? artifacts[0].split(/[\\/]/).pop() || artifacts[0]
-      : artifacts.length > 1
-        ? t('notify.artifacts', artifacts.length)
-        : ''
-
-  const detail = [taskId, artifactText].filter(Boolean).join(' · ')
-  const title = t(spec.titleKey)
-  const message = body || taskId || title
+  const notice = ev.notification
+  const title = notice ? notice.category : 'Kanban task update'
+  const message = notice?.text || `[${slug}] ${taskId}: ${ev.kind}. Current state unavailable. Inspect the card`
   host.notify({
-    kind: spec.toast,
+    kind: notice?.historical || notice?.category === 'information' ? 'info' : spec.toast,
     title,
     message,
-    ...(detail ? { detail } : {}),
     action: { label: t('notify.openKanban'), onClick: () => host.navigate('/kanban') }
   })
-
-  // Native OS notification — the desktop shell fires it only while the user
-  // is away from Hermes (the toast above covers the foreground case). Isolated:
-  // a missing/broken shell must not mark the toast as unfired.
   try {
-    osDoor?.notify({ title, body: [message, detail].filter(Boolean).join('\n') })
+    osDoor?.notify({ title, body: message })
   } catch {
-    /* swallowed */
+    /* The in-app notice remains available if the OS door fails. */
   }
 }
 
@@ -192,23 +123,23 @@ export async function onKanbanEventsFrame(slug: string, events?: CompletionEvent
   let fired = false
   let cursor = seen
 
-  for (const ev of events) {
-    if (typeof ev.id !== 'number' || ev.id <= cursor) {
+  for (const ev of [...events].sort((a, b) => Number(a.id) - Number(b.id))) {
+    if (typeof ev.id !== 'number' || !Number.isSafeInteger(ev.id) || ev.id <= cursor) {
       continue
     }
 
     cursor = ev.id
-    seenEventIdByBoard.set(slug, cursor)
     const spec = TERMINAL_NOTIFY.get(ev.kind ?? '')
 
-    if (spec) {
+    if (spec && ev.notification !== null) {
       try {
-        notifyOne(ev.kind!, spec, ev)
+        notifyOne(slug, spec, ev)
         fired = true
       } catch {
-        /* swallowed */
+        break
       }
     }
+    seenEventIdByBoard.set(slug, cursor)
   }
 
   return fired

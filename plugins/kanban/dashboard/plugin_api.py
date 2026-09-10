@@ -3017,6 +3017,8 @@ async def stream_events(ws: WebSocket):
         except ValueError:
             ws_board = None
 
+        ws_board = ws_board or kanban_db.get_current_board()
+
         def _fetch_new(cursor_val: int) -> tuple[int, list[dict]]:
             nonlocal event_conn
             if event_conn is None:
@@ -3033,7 +3035,14 @@ async def stream_events(ws: WebSocket):
                     payload = json.loads(r["payload"]) if r["payload"] else None
                 except Exception:
                     payload = None
+                from hermes_cli.kanban_notifications import notification_for_event
+                event = kanban_db.Event(r["id"], r["task_id"], r["kind"], payload,
+                                        r["created_at"], r["run_id"])
+                notification = notification_for_event(event_conn, event, ws_board)
+                if notification:
+                    notification.pop("artifact_paths", None)
                 out.append({
+                    "notification": notification,
                     "id": r["id"],
                     "task_id": r["task_id"],
                     "run_id": r["run_id"],

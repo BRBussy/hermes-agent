@@ -67,6 +67,7 @@ def _make_completed_task(delivery_mode):
         tid = kb.create_task(
             conn,
             title="wake ordering task",
+            execution_authority="Isolated notification fixture",
             assignee="worker",
             session_id="agent:main:telegram:dm:chat-1",
         )
@@ -78,7 +79,7 @@ def _make_completed_task(delivery_mode):
             chat_type="dm",
             delivery_mode=delivery_mode,
         )
-        kb.complete_task(conn, tid, summary="done")
+        assert kb.complete_task(conn, tid, summary="done")
         return tid
     finally:
         conn.close()
