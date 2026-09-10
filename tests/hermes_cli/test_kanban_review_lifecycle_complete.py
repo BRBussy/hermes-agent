@@ -319,7 +319,13 @@ def test_reclaim_fails_safe_on_non_object_claim_provenance(conn) -> None:
             "AND run_id = (SELECT current_run_id FROM tasks WHERE id = ?)",
             (task_id, task_id),
         )
-    assert kb.reclaim_task(conn, task_id, signal_fn=lambda *_args: None)
+    from tests.hermes_cli.test_kanban_worker_identity import spawn, stop
+    proc = spawn(conn, _review)
+    try:
+        assert kb.reclaim_task(conn, task_id)
+        proc.wait(timeout=3)
+    finally:
+        stop(proc)
     task = kb.get_task(conn, task_id)
     assert task is not None
     assert task.status == "ready"
@@ -357,7 +363,13 @@ def test_interrupted_review_runs_retry_in_review_phase(
             )
         assert kb.release_stale_claims(conn) == 1
     elif reclaim_kind == "manual_reclaim":
-        assert kb.reclaim_task(conn, task_id, reason="operator retry")
+        from tests.hermes_cli.test_kanban_worker_identity import spawn, stop
+        proc = spawn(conn, review)
+        try:
+            assert kb.reclaim_task(conn, task_id, reason="operator retry")
+            proc.wait(timeout=3)
+        finally:
+            stop(proc)
     else:
         old = int(time.time()) - 1_000
         with kb.write_txn(conn):

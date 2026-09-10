@@ -453,9 +453,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("--initial-status",
                           choices=sorted(kb.VALID_INITIAL_STATUSES),
                           default="running",
-                          help="Initial card status. Use 'blocked' for cards "
-                               "that require immediate human ops (R3 gate) "
-                               "to skip the brief running-to-blocked transition.")
+                          help="Initial card status. Blocked creates a durable hold "
+                               "that requires explicit resumption.")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- swarm ---
@@ -555,7 +554,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     # --- reclaim / reassign (recovery) ---
     p_reclaim = sub.add_parser(
         "reclaim",
-        help="Release an active worker claim on a running task",
+        help="Stop a verified worker and return its task to the dispatch queue",
     )
     p_reclaim.add_argument("task_id")
     p_reclaim.add_argument(
@@ -695,7 +694,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="JSON dict of structured facts to store on the latest completed run.",
     )
 
-    p_block = sub.add_parser("block", help="Mark one or more tasks blocked")
+    p_block = sub.add_parser("block", help="Hold tasks for operator resumption, stopping verified active workers")
     p_block.add_argument("task_id")
     p_block.add_argument("reason", nargs="*", help="Reason (also appended as a comment)")
     p_block.add_argument("--ids", nargs="+", default=None,
@@ -711,7 +710,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         ),
     )
 
-    p_schedule = sub.add_parser("schedule", help="Park one or more tasks in Scheduled (waiting on time, not human input)")
+    p_schedule = sub.add_parser("schedule", help="Park tasks in Scheduled, stopping verified active workers")
     p_schedule.add_argument("task_id")
     p_schedule.add_argument("reason", nargs="*", help="Reason/timing note (also appended as a comment)")
     p_schedule.add_argument("--ids", nargs="+", default=None,
@@ -2082,7 +2081,7 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
         )
     if not ok:
         print(
-            f"cannot reclaim {args.task_id} (not running or unknown id)",
+            f"cannot reclaim {args.task_id} (not reclaimable, worker exit unverified, or unknown id)",
             file=sys.stderr,
         )
         return 1

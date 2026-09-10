@@ -1202,3 +1202,42 @@ The task must be terminal, without an active owning attempt or dependent child. 
 Successful retirement moves the complete workspace directory and its per-worktree Git metadata into private recovery storage inside the common repository directory. It preserves the branch. This retires the active path and Git registration while retaining recovery bytes and any late writes through open file descriptors. It does not reclaim that disk space or provide independent backup coverage. Purging recovery storage requires a separate policy and authority.
 
 Task details expose disposal receipts, workspace availability and unexpected recreation of a retired path. Receipts distinguish `retained`, `refused`, `removed`, `failed` and `unknown`, and include authority, task/run identity, checks, timestamps and recovery references. Reusing a request identifier returns its recorded outcome without repeating filesystem actions. An interrupted operation requires reconciliation of its intent, original paths and recovery paths. Preserve both directories and branch references until ownership and contents are verified. Task and board ownership records remain retained after workspace retirement.
+
+
+## Explicit holds and operator interruption
+
+Initial Blocked creation records a durable hold in the creation transaction.
+Blocked cards without provenance also require explicit resumption. Dependency
+waits use Todo and become eligible after their parents complete, subject to
+execution authority and workspace admission.
+
+| Operator action | Result |
+|---|---|
+| Block | Stops the verified worker and holds the card until explicit resumption. Repeated operator holds remain Blocked |
+| Schedule | Stops the verified worker and parks future work. A review attempt retains its review phase |
+| Reclaim | Stops the verified worker and returns the card to its retry queue, allowing automatic dispatch |
+| Unblock | Resumes an inactive Blocked or Scheduled card, waiting in Todo if parents remain incomplete |
+
+Use Block or Schedule for a pause. Reclaim followed by Schedule comprises two
+operations and permits dispatch between them. Dashboard single and bulk status
+moves apply the same worker-exit check. Run-specific termination refuses a
+request targeting a replaced run.
+
+On POSIX, operator interruption freezes the verified worker before discovering
+and suspending its descendants, including descendants in separate sessions.
+It verifies descendant exit before forcefully terminating the owning worker.
+A failed stop retains run ownership and can leave the worker suspended. Inspect
+its process evidence and retry the same operator action after resolving the
+failure. An unregistered launch or unobservable identity is refused. Live
+interruption requires suspension support.
+
+Worker lifecycle calls supply their current run ID and perform cooperative
+handoffs. Resumption waits for worker exit. Calls from a replaced run cannot
+block, complete, request review or heartbeat its successor. Repeating resumption
+does not create another run, and atomic claims limit dispatch to one attempt.
+
+A terminal run record alone does not prove that execution stopped. Operator
+termination metadata records the observed worker exit and, when it stopped a
+live tree, verified descendant exit. Jobs outside that observed tree and already
+submitted external operations need separate reconciliation. Production model
+cancellation and external publication recovery require their own acceptance.

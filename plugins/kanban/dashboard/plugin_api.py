@@ -1135,16 +1135,7 @@ def _invalidate_descendants_for_parent_reopen(
 def _set_status_direct(
     conn: sqlite3.Connection, task_id: str, new_status: str,
 ) -> bool:
-    """Direct status write for drag-drop moves that aren't covered by the
-    structured complete/block/unblock/archive verbs (e.g. todo<->ready,
-    running<->ready). Appends a ``status`` event row for the live feed.
-
-    When this transitions OFF ``running`` to anything other than the
-    terminal verbs above (which own their own run closing), we close the
-    active run with outcome='reclaimed' so attempt history isn't
-    orphaned. ``running -> ready`` via drag-drop is the common case
-    (user yanking a stuck worker back to the queue).
-    """
+    """Apply an operator status change after verifying any current worker exit."""
     terminations: list[tuple[Optional[int], Optional[str]]] = []
     effective_status = new_status
     with kanban_db.write_txn(conn):
@@ -1183,6 +1174,9 @@ def _set_status_direct(
             ):
                 return False
 
+        termination = kanban_db._stop_operator_worker(conn, task_id)
+        if termination is None:
+            return False
         was_running = prev["status"] == "running"
         reopening_satisfied_parent = (
             prev["status"] in {"done", "archived"}
@@ -1211,8 +1205,8 @@ def _set_status_direct(
                 conn, task_id,
                 outcome="reclaimed", status="reclaimed",
                 summary=f"status changed to {effective_status} (dashboard/direct)",
+                metadata={"operator_termination": termination} if termination else None,
             )
-            terminations.append((prev["worker_pid"], prev["claim_lock"]))
         conn.execute(
             "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
             "VALUES (?, ?, 'status', ?, ?)",
@@ -1725,22 +1719,10 @@ def terminate_run_endpoint(
     payload: TerminateRunBody,
     board: Optional[str] = Query(None, description="Kanban board slug (omit for current)"),
 ):
-    """Terminate the worker process backing an in-flight run.
+    """Reclaim exactly the requested run, making its card eligible for retry.
 
-    Resolves ``run_id`` to its parent ``task_id`` and routes through
-    :func:`kanban_db.reclaim_task` so the SIGTERM->SIGKILL flow,
-    run-outcome bookkeeping, and event-log append all match what the
-    existing ``POST /tasks/{task_id}/reclaim`` endpoint does.
-
-    Responses:
-      * 200 ``{"ok": true, "run_id": ..., "task_id": ...}`` on success.
-      * 404 when ``run_id`` is unknown.
-      * 409 when the run has already ended, or the task is no longer in
-        a claimable state.
-
-    Closes the gap left by PR #28432, which shipped the read-only
-    sibling endpoints (``/workers/active``, ``/runs/{run_id}``,
-    ``/runs/{run_id}/inspect``) but no termination control surface.
+    Block or Schedule holds a card for operator resumption. A stale run request
+    receives 409 and cannot terminate the replacement run.
     """
     board = _resolve_board(board)
     conn = _conn(board=board)
@@ -1753,7 +1735,9 @@ def terminate_run_endpoint(
                 status_code=409,
                 detail=f"run {run_id} already ended",
             )
-        ok = kanban_db.reclaim_task(conn, r.task_id, reason=payload.reason)
+        ok = kanban_db.reclaim_task(
+            conn, r.task_id, reason=payload.reason, expected_run_id=run_id,
+        )
         if not ok:
             raise HTTPException(
                 status_code=409,

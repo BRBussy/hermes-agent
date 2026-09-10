@@ -3598,6 +3598,10 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
+                if task_status == "blocked":
+                    _append_event(conn, task_id, "blocked", {
+                        "origin": "initial_status", "source_status": "ready",
+                    })
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
         except sqlite3.IntegrityError:
@@ -4505,56 +4509,23 @@ def _synthesize_ended_run(
 # ---------------------------------------------------------------------------
 
 def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Return True when ``task_id`` is sticky-blocked by an explicit
-    worker/operator ``kanban_block`` call (#28712).
-
-    A ``blocked`` status can come from two very different sources:
-
-    * **Worker- or operator-initiated** — a worker called
-      ``kanban_block(reason="review-required: ...")`` (or somebody ran
-      ``hermes kanban block <id>``).  This is a deliberate handoff that
-      should stay blocked until an operator unblocks it.  The block tool
-      emits a ``"blocked"`` event row in ``task_events``.
-
-    * **Circuit-breaker** — ``_record_task_failure`` tripped after
-      repeated crashes / spawn failures / timeouts.  This emits
-      ``"gave_up"``, *not* ``"blocked"``, and is meant to recover
-      automatically once the underlying conditions change (e.g. parents
-      finish, transient infra error clears).
-
-    The cheapest signal that distinguishes the two is the most recent
-    ``"blocked"`` / ``"unblocked"`` event for the task.  If the most
-    recent one is ``"blocked"`` (or there is a ``"blocked"`` event and
-    no ``"unblocked"`` event has fired since), the task is sticky and
-    ``recompute_ready`` must *not* auto-promote it.
-
-    Returns ``False`` when there is no such event at all (e.g. the task
-    was set to ``status='blocked'`` by the circuit breaker or by direct
-    DB manipulation) — preserves the pre-#28712 auto-recover semantics
-    for that path.
-    """
+    """Explicit blocks and blocks without provenance require explicit resumption."""
     row = conn.execute(
         "SELECT kind FROM task_events "
         "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    return bool(row) and row["kind"] == "blocked"
+    return row is None or row["kind"] == "blocked"
 
 
 def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
-    """Return the durable phase a blocked/dependency-wait task should resume.
-
-    Events written by review workers carry ``source_status``/``retry_status``;
-    an explicit unblock that must wait for parents carries ``resume_status``.
-    Legacy events omit these fields and therefore retain the historical
-    ``ready`` behavior.
-    """
+    """Recover the review phase from the latest resumable lifecycle event."""
     row = conn.execute(
         "SELECT payload FROM task_events "
         "WHERE task_id = ? AND kind IN ("
         "'blocked', 'block_loop_detected', 'dependency_wait', 'gave_up', "
-        "'unblocked', 'changes_requested', 'review_reopened', 'status', 'reclaimed', "
+        "'unblocked', 'scheduled', 'changes_requested', 'review_reopened', 'status', 'reclaimed', "
         "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited'"
         ") ORDER BY id DESC LIMIT 1",
         (task_id,),
@@ -4574,34 +4545,11 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
 ) -> int:
-    """Promote ``todo`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
+    """Promote authorised dependency waits whose parents are complete.
 
-    Returns the number of tasks promoted.  Opens its own IMMEDIATE txn, so it
-    MUST be called OUTSIDE any open write transaction (plain ``write_txn``
-    raises on nesting); call it after the enclosing txn commits.
-
-    ``blocked`` tasks are also considered for promotion (so a task
-    blocked purely by a parent dependency unblocks itself when the
-    parent completes), *except* in two cases:
-
-    1. The most recent block event was a worker-initiated
-       ``kanban_block`` — those stay blocked until an explicit
-       ``kanban_unblock`` (#28712).
-
-    2. The task's ``consecutive_failures`` has reached the effective
-       failure limit.  This prevents infinite retry loops when a task
-       repeatedly exhausts its iteration budget: without this guard the
-       counter would reset on every recovery cycle and the circuit
-       breaker could never trip (#35072).
-
-    The effective failure limit resolves in the same order as the
-    circuit breaker in ``_record_task_failure`` so the two never
-    disagree about when a task is permanently blocked:
-
-      1. per-task ``max_retries`` if set
-      2. caller-supplied ``failure_limit`` (the dispatcher passes the
-         ``kanban.failure_limit`` config value through ``dispatch_once``)
-      3. ``DEFAULT_FAILURE_LIMIT``
+    Explicit holds and blocked cards without provenance require resumption.
+    Failure limits still constrain recovery after an explicit unblock event.
+    Call outside any write transaction.
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
@@ -4618,10 +4566,6 @@ def recompute_ready(
                 continue
             cur_status = row["status"]
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
-                # Worker / operator asked for explicit human intervention — do not
-                # silently auto-recover.  ``unblock_task`` is the only
-                # legitimate exit (it emits ``"unblocked"`` which flips
-                # this predicate back).
                 continue
             parents = conn.execute(
                 "SELECT t.status FROM tasks t "
@@ -5180,38 +5124,134 @@ def release_stale_claims(
     return reclaimed
 
 
+def _stop_operator_worker(conn, task_id, *, signal_fn=None):
+    """Verify worker exit under the caller's write lock before releasing ownership.
+
+    A claim awaiting PID registration is unresolved and must retain ownership.
+    Worker lifecycle calls supply their run ID and perform cooperative handoffs.
+    """
+    from hermes_cli.kanban_worker import active_worker_exists, can_observe_identity
+
+    task = get_task(conn, task_id)
+    if not task:
+        return None
+    if not task.current_run_id:
+        if task.claim_lock or task.status == "running":
+            return None
+        return None if active_worker_exists(conn, task_id) else {}
+    row = conn.execute(
+        "SELECT identity FROM worker_attempts WHERE run_id = ? AND task_id = ? AND claim_lock = ?",
+        (task.current_run_id, task_id, task.claim_lock),
+    ).fetchone()
+    if not row or not row[0]:
+        return None
+    identity = json.loads(row[0])
+    if (identity.get('pid') != task.worker_pid
+            or identity.get('task_id') != task_id
+            or identity.get('run_id') != task.current_run_id
+            or identity.get('claim_lock') != task.claim_lock
+            or not can_observe_identity(identity)):
+        return None
+    from hermes_cli.kanban_worker import identity_alive, signal_identity
+    tree_count = None
+    if signal_fn is None and identity_alive(identity):
+        import signal
+        import psutil
+
+        if not hasattr(signal, "SIGSTOP"):
+            return None
+        # Freeze before discovery. Keep the owning parent alive until every
+        # descendant exits, so a failed stop retains observable ownership.
+        try:
+            signal_identity(identity, signal.SIGSTOP)
+            parent = psutil.Process(task.worker_pid)
+            deadline = time.monotonic() + 2
+            while parent.status() != psutil.STATUS_STOPPED:
+                if time.monotonic() >= deadline:
+                    return None
+                time.sleep(0.01)
+            stopped = {}
+            for _ in range(8):
+                descendants = parent.children(recursive=True)
+                found = False
+                for child in descendants:
+                    try:
+                        key = (child.pid, child.create_time())
+                        if key not in stopped and child.status() != psutil.STATUS_ZOMBIE:
+                            child.suspend()
+                            stopped[key] = child
+                            deadline = time.monotonic() + 2
+                            while child.status() not in {psutil.STATUS_STOPPED, psutil.STATUS_ZOMBIE}:
+                                if time.monotonic() >= deadline:
+                                    return None
+                                time.sleep(0.01)
+                            found = True
+                    except psutil.NoSuchProcess:
+                        continue
+                if not found:
+                    break
+            else:
+                return None
+            for child in stopped.values():
+                try:
+                    child.kill()
+                except psutil.NoSuchProcess:
+                    pass
+            deadline = time.monotonic() + 2
+            while stopped:
+                for key, child in list(stopped.items()):
+                    try:
+                        if not child.is_running() or child.status() == psutil.STATUS_ZOMBIE:
+                            del stopped[key]
+                    except psutil.NoSuchProcess:
+                        del stopped[key]
+                if not stopped:
+                    break
+                if time.monotonic() >= deadline:
+                    return None
+                time.sleep(0.05)
+            tree_count = len(descendants)
+            signal_fn = lambda _pid, _sig: signal_identity(identity, signal.SIGKILL)
+        except (OSError, psutil.Error):
+            return None
+    termination = _terminate_reclaimed_worker(
+        task.worker_pid, task.claim_lock, signal_fn=signal_fn, conn=conn,
+    )
+    if _worker_survived_termination(termination) or active_worker_exists(conn, task_id):
+        return None
+    if tree_count is not None:
+        termination.update(sigkill=True, descendants_exit_verified=True,
+                           descendant_count=tree_count, stop_method="frozen_tree")
+    termination['exit_verified'] = True
+    return termination
+
+
 def reclaim_task(
     conn: sqlite3.Connection,
     task_id: str,
     *,
     reason: Optional[str] = None,
     signal_fn=None,
+    expected_run_id: Optional[int] = None,
 ) -> bool:
-    """Operator-driven reclaim: release the claim and restore its source phase.
+    """Stop the verified current worker and return the card to its retry queue.
 
-    Unlike :func:`release_stale_claims` which only acts on tasks whose
-    ``claim_expires`` has passed, this function reclaims immediately
-    regardless of TTL. Intended for the dashboard/CLI recovery flow
-    when an operator wants to abort a running worker without waiting
-    for the TTL to expire (e.g. after seeing a hallucination warning).
-
-    Returns True if a reclaim happened, False if the task isn't in a
-    reclaimable state (not running, or doesn't exist).
+    This operation permits another dispatch. Use block or schedule to pause.
+    Unobservable or surviving workers retain their claim and run ownership.
     """
-    row = conn.execute(
-        "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
-        (task_id,),
-    ).fetchone()
-    if not row:
-        return False
-    if row["status"] != "running" and row["claim_lock"] is None:
-        # Nothing to reclaim — already ready / blocked / done.
-        return False
-    prev_lock = row["claim_lock"]
-    termination = _terminate_reclaimed_worker(
-        row["worker_pid"], prev_lock, signal_fn=signal_fn, conn=conn,
-    )
     with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, claim_lock, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if not row or (row["status"] != "running" and row["claim_lock"] is None):
+            return False
+        if expected_run_id is not None and row["current_run_id"] != expected_run_id:
+            return False
+        prev_lock = row["claim_lock"]
+        termination = _stop_operator_worker(conn, task_id, signal_fn=signal_fn)
+        if termination is None:
+            return False
         retry_status = _retry_status_for_run(conn, task_id)
         cur = conn.execute(
             "UPDATE tasks SET status = ?, claim_lock = NULL, "
@@ -6105,49 +6145,35 @@ def block_task(
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
-    """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
+    """Hold work until explicit resumption, or wait on dependencies in ``todo``.
 
-    ``kind`` (one of :data:`VALID_BLOCK_KINDS`, or ``None`` for a legacy
-    un-typed block) drives routing instead of every block landing in one
-    undifferentiated ``blocked`` bucket:
-
-    * ``dependency`` — the task is only waiting on another task. It does NOT
-      sit in ``blocked`` (where a cron would keep "unblocking" it); it goes to
-      ``todo`` so the existing parent-gating / ``recompute_ready`` machinery
-      promotes it automatically once its parents finish. No human, no cron, no
-      retry storm. This is Dale's "Type 2 — dependency blocked".
-
-    * ``needs_input`` / ``capability`` / ``None`` — "truly blocked" (Dale's
-      "Type 1"). Lands in ``blocked`` for a human. BUT: each time such a task
-      is re-blocked for the SAME kind after having been unblocked, the
-      unblock-loop counter (``block_recurrences``) increments. When it reaches
-      :data:`BLOCK_RECURRENCE_LIMIT`, the task is routed to ``triage`` instead
-      of ``blocked`` — breaking the cron-unblock ↔ worker-re-block loop and
-      forcing a human-in-the-loop triage decision.
-
-    * ``transient`` — treated like a generic block for routing, but a worker
-      can use it to signal "this might clear on its own"; it still participates
-      in the loop breaker so a forever-flaky task eventually escalates.
-
-    Returns True on any successful transition (to ``blocked``, ``todo``, or
-    ``triage``), False when the task wasn't in a blockable state.
+    Operator holds stop the verified worker and stay blocked across repeated
+    holds. Worker calls supply their current run ID for a cooperative handoff.
+    Repeated worker blocks of one kind escalate at BLOCK_RECURRENCE_LIMIT.
     """
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    operator_hold = expected_run_id is None and kind != "dependency"
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
-        if cur_row is None:
+        if cur_row is None or cur_row["status"] not in {"todo", "ready", "running", "review"}:
             return False
+        if expected_run_id is None:
+            termination = _stop_operator_worker(conn, task_id)
+            if termination is None:
+                return False
+            if termination:
+                metadata = {**(metadata or {}), "operator_termination": termination}
         source_status = (
             _retry_status_for_run(conn, task_id)
             if cur_row["status"] == "running"
-            else "ready"
+            else ("review" if cur_row["status"] == "review" else "ready")
         )
         prev_kind = cur_row["block_kind"] if "block_kind" in cur_row.keys() else None
         prev_recurrences = (
@@ -6157,10 +6183,6 @@ def block_task(
             else 0
         )
 
-        # Dependency blocks never enter the human ``blocked`` bucket — they
-        # wait in ``todo`` and let ``recompute_ready`` gate on parents. Routing
-        # here (rather than ``blocked``) is what keeps a cron from ever seeing
-        # a dependency-wait as something to "unblock".
         if kind == "dependency":
             cur = conn.execute(
                 """
@@ -6207,18 +6229,10 @@ def block_task(
             )
             return True
 
-        # Truly-blocked kinds. Increment the unblock-loop counter when this is a
-        # re-block for the SAME reason after a prior unblock. block_task only
-        # fires from running/ready (i.e. AFTER an unblock returned the task to
-        # the work pool), so a stored block_kind that matches the incoming kind
-        # means: blocked → unblocked → about-to-re-block for the same cause.
-        # An un-typed (None) block compares as "same" to a prior un-typed block.
         same_cause = prev_kind == kind
-        recurrences = prev_recurrences + 1 if same_cause else 1
+        recurrences = prev_recurrences if operator_hold else (prev_recurrences + 1 if same_cause else 1)
 
-        if recurrences >= BLOCK_RECURRENCE_LIMIT:
-            # Loop detected — stop letting the unblocker spin this task. Route
-            # to triage for a human-in-the-loop decision instead of blocked.
+        if not operator_hold and recurrences >= BLOCK_RECURRENCE_LIMIT:
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -6268,7 +6282,7 @@ def block_task(
                            block_kind    = ?,
                            block_recurrences = ?
                      WHERE id = ?
-                       AND status IN ('running', 'ready')
+                       AND status IN ('todo', 'running', 'ready', 'review')
                     """,
                     (kind, recurrences, task_id),
                 )
@@ -6295,8 +6309,6 @@ def block_task(
                 outcome="blocked", status="blocked",
                 summary=summary or reason, metadata=metadata,
             )
-            # Synthesize a run when blocking a never-claimed task so the
-            # reason is preserved in attempt history.
             if run_id is None and (reason or summary or metadata):
                 run_id = _synthesize_ended_run(
                     conn, task_id,
@@ -6708,12 +6720,7 @@ def promote_task(
 def _reclaim_dangling_run(
     conn: sqlite3.Connection, task_id: str, *, statuses, now: int, note: str,
 ) -> None:
-    """Close a leaked ``current_run_id`` (run row still open) before a status
-    flip, preserving the runs invariant (``current_run_id IS NULL`` ⇔ run row
-    terminal). No-op in the common path where the prior transition already
-    closed the run. Shared by :func:`unblock_task` and
-    :func:`reopen_review_task` so the recovery can't drift.
-    """
+    """Close a dangling review run during explicit review reopening."""
     placeholders = ", ".join("?" for _ in statuses)
     stale = conn.execute(
         f"SELECT current_run_id FROM tasks WHERE id = ? AND status IN ({placeholders})",
@@ -6755,47 +6762,28 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
 
 
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Transition ``blocked``/``scheduled`` to its safe resumable phase.
-
-    Defensively closes any stale ``current_run_id`` pointer before flipping
-    status. In the common path (``block_task`` closed the run already) this
-    is a no-op. If a future or external write left the pointer dangling,
-    the leaked run is closed as ``reclaimed`` inside the same txn so the
-    runs invariant (``current_run_id IS NULL`` ⇔ run row in terminal
-    state) holds for the rest of this function's lifetime.
-    """
-    now = int(time.time())
+    """Resume an inactive hold after dependency and process-ownership checks."""
     with write_txn(conn):
+        from hermes_cli.kanban_worker import active_worker_exists
+        task = get_task(conn, task_id)
+        if not task or task.current_run_id or task.claim_lock or active_worker_exists(conn, task_id):
+            return False
         current = conn.execute(
             "SELECT status FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         resume_status = (
             _resume_status_from_events(conn, task_id)
-            if current and current["status"] == "blocked"
+            if current and current["status"] in ("blocked", "scheduled")
             else "ready"
         )
-        _reclaim_dangling_run(
-            conn, task_id, statuses=("blocked", "scheduled"), now=now,
-            note="invariant recovery on unblock",
-        )
-        # Re-gate on parent completion before restoring the source phase.
         landing_status = _landing_status_after_parents(conn, task_id)
         new_status = (
             "review"
             if landing_status == "ready" and resume_status == "review"
             else landing_status
         )
-        # NOTE: deliberately does NOT touch ``block_recurrences`` or
-        # ``block_kind``. Resetting the recurrence counter on unblock is exactly
-        # the amnesia that let a cron unblock → worker re-block loop run
-        # unbounded (Dale's report). The counter survives the unblock so that a
-        # subsequent same-cause ``block_task`` can detect the loop and route to
-        # triage at ``BLOCK_RECURRENCE_LIMIT``. It is reset to 0 only on a
-        # successful completion (see ``complete_task``). ``consecutive_failures``
-        # (the *dispatcher* spawn/crash/timeout counter — a different signal) is
-        # still reset here, which is correct: a deliberate unblock is a fresh
-        # start for the dispatcher's retry budget.
+        # Recurrence survives resumption so repeated worker blockers can escalate.
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
             "consecutive_failures = 0, last_failure_error = NULL "
@@ -6820,9 +6808,8 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
 
     The "changes requested" counterpart of :func:`request_review`: sends the
     task back out of the review lane so the dispatcher re-runs the implementer
-    on the new comments. Mirrors :func:`unblock_task` (parent re-gating,
-    defensive stale-run close, ``consecutive_failures`` preserved) and emits a
-    ``review_reopened`` event.
+    on the new comments. Parent gating preserves dependencies, and the
+    transition emits a ``review_reopened`` event.
 
     Deliberately does NOT touch ``block_recurrences``/``block_kind``: review is
     not a block, so there is no loop counter to reset. (A stale counter from a
@@ -7812,13 +7799,23 @@ def schedule_task(
     reason: Optional[str] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
-    """Park a task in ``scheduled`` so it is waiting on time, not human input.
+    """Park future work, stopping a verified worker for an operator call.
 
-    ``scheduled`` tasks are intentionally not dispatchable; an external cron,
-    human action, or automation can later call ``unblock_task`` to re-gate them
-    to ``ready`` (or ``todo`` if parents are still incomplete).
+    A worker supplying its run ID schedules cooperatively and must exit before
+    resumption. Scheduled review attempts retain their review phase.
     """
     with write_txn(conn):
+        task = get_task(conn, task_id)
+        if not task or task.status not in {"todo", "ready", "running", "blocked", "review"}:
+            return False
+        source_status = (_retry_status_for_run(conn, task_id) if task.current_run_id
+                         else _resume_status_from_events(conn, task_id)
+                         if task.status == "blocked" else task.status)
+        termination = {}
+        if expected_run_id is None:
+            termination = _stop_operator_worker(conn, task_id)
+            if termination is None:
+                return False
         params: list[Any] = [task_id]
         sql = """
             UPDATE tasks
@@ -7827,7 +7824,7 @@ def schedule_task(
                    claim_expires= NULL,
                    worker_pid   = NULL
              WHERE id = ?
-               AND status IN ('todo', 'ready', 'running', 'blocked')
+               AND status IN ('todo', 'ready', 'running', 'blocked', 'review')
         """
         if expected_run_id is not None:
             sql += " AND current_run_id = ?"
@@ -7838,7 +7835,7 @@ def schedule_task(
         run_id = _end_run(
             conn, task_id,
             outcome="scheduled", status="scheduled",
-            summary=reason,
+            summary=reason, metadata={"operator_termination": termination} if termination else None,
         )
         if run_id is None and reason:
             run_id = _synthesize_ended_run(
@@ -7846,7 +7843,10 @@ def schedule_task(
                 outcome="scheduled",
                 summary=reason,
             )
-        _append_event(conn, task_id, "scheduled", {"reason": reason}, run_id=run_id)
+        _append_event(conn, task_id, "scheduled", {
+            "reason": reason,
+            **({"source_status": "review"} if source_status == "review" else {}),
+        }, run_id=run_id)
         return True
 
 
