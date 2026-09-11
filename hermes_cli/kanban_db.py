@@ -5560,7 +5560,8 @@ def complete_task(
                 conn.execute("UPDATE tasks SET last_failure_error = ? WHERE id = ?", (rejection, task_id))
                 return False
             save(conn, task_id, dict(task.publication, phase="verified",
-                                    receipt=metadata.get("publication_receipt")))
+                                    receipt=metadata.get("publication_receipt"),
+                                    merge_evidence=metadata.get("merge_evidence")))
         prior = conn.execute(
             "SELECT status FROM tasks WHERE id = ?",
             (task_id,),
@@ -10889,6 +10890,11 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     lines.append(f"Independent review required: {task.review_required}")
     if task.publication:
         lines.append("Publication handoff: " + json.dumps(task.publication))
+        lines.append("Before an authorised merge, run hermes kanban merge-check for this card. "
+                     "Resolve its decision points and use the reported head with gh pr merge "
+                     "--match-head-commit, preserving GitHub branch enforcement. "
+                     "Record tests_run in the exact-state developer submission. "
+                     "Report worker verification, GitHub CI and merge authority separately.")
         lines.append("Preserve the accepted files and registered workspace. Perform only the recorded outstanding "
                      "actions within their authority. Reconcile completed actions after interruption. "
                      "The developer submits the published state for fresh independent review.")

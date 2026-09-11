@@ -41,7 +41,7 @@ def observe_publication(task):
     repository = task.repository_identity.removeprefix('github.com/')
     result = subprocess.run(
         ['gh', 'pr', 'list', '--repo', repository, '--head', task.branch_name,
-         '--state', 'all', '--json', 'number,url,headRefOid,state,statusCheckRollup'],
+         '--state', 'all', '--json', 'number,url,headRefOid,baseRefName,state,isDraft,mergeStateStatus,statusCheckRollup'],
         check=True, capture_output=True, text=True, timeout=30,
     )
     prs = json.loads(result.stdout)
@@ -49,14 +49,21 @@ def observe_publication(task):
         raise ValueError('Pull request receipt is ambiguous')
     if any(not isinstance(pr, dict) or not all(pr.get(key) for key in ('number', 'url', 'headRefOid', 'state')) for pr in prs):
         raise ValueError('Pull request receipt is incomplete')
-    return dict(observed_at=int(time.time()), head=head,
+    from hermes_cli.kanban_ci import collect
+    receipts = []
+    for pr in prs:
+        item = dict(number=pr['number'], url=pr['url'], head=pr['headRefOid'], state=pr['state'],
+                    target_branch=pr.get('baseRefName'), merge_state=pr.get('mergeStateStatus'),
+                    is_draft=pr.get('isDraft'), github_checks=pr.get('statusCheckRollup'),
+                    github_checks_state='reported' if pr.get('statusCheckRollup') else
+                    'absent' if pr.get('statusCheckRollup') == [] else 'unavailable')
+        item['ci'] = collect(repository, item)
+        receipts.append(item)
+    return dict(repository=repository, observed_at=int(time.time()), head=head,
                     remote_head=remote_head, branch=task.branch_name, workspace=task.workspace_path,
                     retained_changes=bool(status), status_digest=hashlib.sha256(status.encode()).hexdigest(),
                     existing_commit=head != task.approved_base,
-                    pull_requests=[{'number': pr['number'], 'url': pr['url'], 'head': pr['headRefOid'],
-                                    'state': pr['state'], 'github_checks': pr.get('statusCheckRollup'),
-                                    'github_checks_state': 'reported' if pr.get('statusCheckRollup') else
-                                    'absent' if pr.get('statusCheckRollup') == [] else 'unavailable'} for pr in prs])
+                    pull_requests=receipts)
 
 
 def reconcile(conn, task_id):

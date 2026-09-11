@@ -68,7 +68,8 @@ def remote_receipts(monkeypatch, task, prs):
     def run(argv, **kwargs):
         if argv[0] == 'gh':
             calls.append(argv)
-            return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(prs(head)))
+            data = {'check_runs': []} if '/check-runs?' in argv[-1] else [] if '/statuses?' in argv[-1] else prs(head)
+            return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(data))
         if 'ls-remote' in argv:
             calls.append(argv)
             return subprocess.CompletedProcess(argv, 0, stdout=head + '\trefs/heads/' + task.branch_name + '\n')
@@ -88,7 +89,10 @@ def test_recovery_preserves_changes_and_does_not_repeat_publication(board, repos
     observed = recovery.reconcile(board, tid)
     assert observed['pull_requests'][0]['number'] == 17
     assert observed['retained_changes']
-    assert len(calls) == 2
+    assert calls
+    assert any('ls-remote' in argv for argv in calls)
+    assert any(argv[:3] == ['gh', 'pr', 'list'] for argv in calls)
+    assert observed['pull_requests'][0]['ci']['state'] == 'absent'
     assert all('push' not in argv and 'commit' not in argv and 'create' not in argv for argv in calls)
     admission.authorise(board, tid, 'Resume verification using existing publication receipts')
     kb.recompute_ready(board)

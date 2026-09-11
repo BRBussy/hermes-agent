@@ -20,6 +20,10 @@ def save(conn, task_id, publication):
         "changes_required": "Content requires fresh review",
         "verified": "Publication independently verified",
     }[publication["phase"]])
+    if (publication['phase'] == 'publication_authorised' and 'merge' in publication.get('actions', [])
+            and set(publication['actions']) <= {'merge', 'verify'}
+            and not publication.get('merge_evidence', {}).get('ready')):
+        publication['label'] = 'Merge awaiting CI, verification or authority decision'
     conn.execute("UPDATE tasks SET publication = ? WHERE id = ?",
                  (json.dumps(publication), task_id))
 
@@ -78,6 +82,10 @@ def dispatch_rejection(task):
         return None
     if not publication.get("authority"):
         return "Content accepted. Record scoped publication authority before dispatch"
+    if ('merge' in publication.get('actions', [])
+            and set(publication['actions']) <= {'merge', 'verify'}
+            and not publication.get('merge_evidence', {}).get('ready')):
+        return 'Merge requires a fresh merge-check decision resolving CI, worker verification and authority'
     try:
         if not same_content(publication["accepted_state"], capture_state(task)):
             return "Accepted content changed. Authorise correction and request fresh content review"
@@ -152,6 +160,12 @@ def authorise(conn, task, authority, actions):
     publication.update(phase="publication_authorised", authority=authority,
                        actions=sorted(set(actions) - set(consumed)),
                        consumed_actions=consumed, reconciliation=observed)
+    from hermes_cli.kanban_ci import report, publication_scope
+    if 'merge' in publication['actions']:
+        publication['merge_scope'] = publication_scope(task, observed)
+    publication['merge_evidence'] = report(conn, task, observed, publication)
+    if 'merge' in publication['actions']:
+        publication.pop('merge_preflight', None)
     save(conn, task.id, publication)
     conn.execute(
         "UPDATE tasks SET status = ?, assignee = ?, completed_at = NULL, result = NULL WHERE id = ?",
@@ -186,5 +200,18 @@ def verify_delivery(conn, task, metadata):
             return f"Promised deliverable requires PR state {wanted}"
     if capture_state(task) != current:
         return "Workspace changed during publication verification"
+    from hermes_cli.kanban_ci import report
+    metadata['merge_evidence'] = report(conn, task, observed)
+    if publication['deliverable'] == 'merge':
+        preflight = publication.get('merge_preflight') or {}
+        evidence = metadata['merge_evidence']
+        if (not preflight.get('ready') or preflight.get('scope') != evidence['scope']
+                or preflight.get('policy') != evidence['policy']
+                or not preflight.get('merge_authority', {}).get('reference')
+                or preflight.get('merge_authority', {}).get('merge') is not True):
+            return 'Promised merge requires a retained approved preflight for this exact PR, head, branch and policy'
+        unresolved = [point for point in evidence['decision_points'] if point != 'merge_authority_required']
+        if unresolved:
+            return 'Merged publication has unresolved evidence: ' + ', '.join(unresolved)
     metadata["publication_receipt"] = observed
     return None

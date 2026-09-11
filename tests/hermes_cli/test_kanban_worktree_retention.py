@@ -21,7 +21,11 @@ def git(path, *args):
 
 
 @pytest.fixture
-def fixture(tmp_path, monkeypatch):
+def fixture(tmp_path, monkeypatch, request):
+    try:
+        repository_revision = request.getfixturevalue('repository_revision')
+    except pytest.FixtureLookupError:
+        repository_revision = 'HEAD'
     candidate = Path(__file__).resolve().parents[2]
     source = (candidate / 'venv').resolve().parent
     with tempfile.TemporaryDirectory(prefix='retention-', dir=candidate.parent) as temporary:
@@ -37,12 +41,15 @@ def fixture(tmp_path, monkeypatch):
         shallow = source / '.git/shallow'
         if shallow.exists():
             (repo / '.git/shallow').write_bytes(shallow.read_bytes())
-        base = git(source, 'rev-parse', 'HEAD')
+        base = git(source, 'rev-parse', repository_revision)
         git(repo, 'update-ref', 'refs/heads/main', base)
         git(repo, 'update-ref', 'refs/remotes/origin/main', base)
         git(repo, 'symbolic-ref', 'HEAD', 'refs/heads/main')
         git(repo, 'remote', 'add', 'origin', 'https://github.com/BRBussy/hermes-agent.git')
-        git(repo, 'sparse-checkout', 'set', '--no-cone', 'pyproject.toml')
+        tracked = git(source, 'ls-tree', '-r', '--name-only', base).splitlines()
+        assert tracked
+        seed = 'pyproject.toml' if 'pyproject.toml' in tracked else tracked[0]
+        git(repo, 'sparse-checkout', 'set', '--no-cone', seed)
         git(repo, 'read-tree', '-mu', 'HEAD')
         git(repo, 'remote', 'set-url', 'origin', 'https://github.com/BRBussy/hermes-agent.git')
         with (repo / '.git/info/exclude').open('a') as stream:
@@ -73,11 +80,11 @@ def manifest(task):
     return result
 
 
-def submit(conn, task, session):
+def submit(conn, task, session, *, tests_run=None):
     run = kb.claim_task(conn, task.id)
     assert run
     assert kb.request_review(conn, task.id, summary='Ready for independent review', reviewer='reviewer',
-                             metadata={'worker_session_id': session}, expected_run_id=run.current_run_id)
+                             metadata={'worker_session_id': session, 'tests_run': tests_run}, expected_run_id=run.current_run_id)
     review = kb.claim_review_task(conn, task.id)
     assert review
     return review

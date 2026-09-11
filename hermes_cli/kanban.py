@@ -431,6 +431,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_authorise.add_argument('--authority', required=True)
     p_authorise.add_argument('--publication-action', action='append',
                             choices=['commit', 'push', 'pull_request', 'merge', 'verify'])
+    p_merge_check = sub.add_parser('merge-check', help='Retain a fresh CI and authority decision before a conditional merge')
+    p_merge_check.add_argument('task_id')
+    p_merge_check.add_argument('--exception-json', help='Operator-recorded scoped CI exception as JSON')
     p_create.add_argument("--review-required", action="store_true")
     p_create.add_argument("--model", default=None, dest="model_override",
                           help="Pin the worker to this model (passed as "
@@ -1185,6 +1188,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "prepare": _cmd_prepare,
             "authorise": _cmd_authorise,
             "recover": _cmd_recover,
+            "merge-check": _cmd_merge_check,
             "swarm":    _cmd_swarm,
             "list":     _cmd_list,
             "ls":       _cmd_list,
@@ -1264,6 +1268,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "prepare",
     "authorise",
     "recover",
+    "merge-check",
     "create",
     "swarm",
     "assign",
@@ -1681,6 +1686,15 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
         count_str = ", ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "(idle)"
         print(f"{entry['name']:20s}  {on_disk:8s}  {count_str}")
     return 0
+
+
+def _cmd_merge_check(args):
+    from hermes_cli.kanban_ci import preflight
+    exception = json.loads(args.exception_json) if args.exception_json else None
+    with kb.connect_closing() as conn:
+        decision = preflight(conn, args.task_id, exception=exception)
+        print(json.dumps(decision, indent=2))
+    return 0 if decision['ready'] else 1
 
 
 def _cmd_recover(args):

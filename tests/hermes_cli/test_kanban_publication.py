@@ -26,6 +26,11 @@ def remote(monkeypatch, fixture):
         return real_git(path, *args)
 
     def run(args, **kwargs):
+        if args[:2] == ['gh', 'api']:
+            if state.get('unavailable'):
+                raise subprocess.CalledProcessError(1, args)
+            data = {'check_runs': state.get('runs', [])} if '/check-runs?' in args[-1] else state.get('statuses', [])
+            return subprocess.CompletedProcess(args, 0, json.dumps(data), '')
         if args[:3] == ["gh", "pr", "list"]:
             return subprocess.CompletedProcess(args, 0, json.dumps(state["prs"]), "")
         return real_run(args, **kwargs)
@@ -52,7 +57,8 @@ def publish_receipt(task, remote, *, state="OPEN"):
     head = git(task.workspace_path, "rev-parse", "HEAD")
     remote["head"] = head
     remote["prs"] = [{"number": 7, "url": "https://github.com/BRBussy/hermes-agent/pull/7",
-                      "headRefOid": head, "state": state, "statusCheckRollup": []}]
+                      "headRefOid": head, "baseRefName": "main", "isDraft": False, "mergeStateStatus": "CLEAN",
+                      "state": state, "statusCheckRollup": []}]
 
 
 def pending(fixture):
@@ -209,9 +215,14 @@ def test_retry_reconciles_consumed_actions_and_same_workspace(fixture, remote):
     assert "consumed_actions" in kb.build_worker_context(conn, task.id)
 
 
-def test_later_authorised_merge_reopens_same_card_and_retains_reviews(fixture, remote):
+def test_later_authorised_merge_reopens_same_card_and_retains_reviews(fixture, remote, monkeypatch):
+    from hermes_cli.kanban_ci import preflight
+    from hermes_cli import config
+    monkeypatch.setattr(config, 'load_config_readonly', lambda: {'kanban': {'repository_ci_policies': {
+        'brbussy/hermes-agent': {'main': {'approval': 'Fixture policy', 'branch_rules': 'Fixture rules',
+                                      'required_checks': [], 'allow_no_ci': True}}}}})
     conn, task, repo = fixture
-    review = submit(conn, task, "developer")
+    review = submit(conn, task, "developer", tests_run=["Fixture worker verification report"])
     assert accept(conn, task, review, outcome="approved", session="reviewer")
     history = [run.id for run in kb.list_runs(conn, task.id)]
     publish_receipt(task, remote)
@@ -220,9 +231,10 @@ def test_later_authorised_merge_reopens_same_card_and_retains_reviews(fixture, r
     assert reopened.status == "ready"
     assert reopened.publication["deliverable"] == "merge"
     assert reopened.workspace_path == task.workspace_path
+    assert preflight(conn, task.id)["ready"]
     publish_receipt(task, remote, state="MERGED")
     remote["head"] = None
-    final = submit(conn, task, "publisher")
+    final = submit(conn, task, "publisher", tests_run=["Fixture final worker report"])
     assert accept(conn, task, final, outcome="approved", session="merge-reviewer")
     assert set(history) < {run.id for run in kb.list_runs(conn, task.id)}
 
