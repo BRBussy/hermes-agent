@@ -88,7 +88,7 @@ def test_conflicting_preparation_and_origin_are_rejected(board, repository):
 
 
 def test_concurrent_claims_start_one_attempt(board, repository):
-    tid = kb.create_task(board, title='Repository task', task_scope='repository')
+    tid = kb.create_task(board, title='Repository task', body='Perform the authorised repository concurrency fixture', task_scope='repository')
     prepare(board, tid, repository)
     admission.authorise(board, tid, 'Concurrency fixture approval')
     kb.recompute_ready(board)

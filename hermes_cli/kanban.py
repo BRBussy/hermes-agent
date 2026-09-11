@@ -70,6 +70,9 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "task_scope": t.task_scope,
         "execution_authority": t.execution_authority,
         "publication": t.publication,
+        "workspace_set": t.workspace_set,
+        "idempotency_key": t.idempotency_key,
+        "reasoning_effort": t.reasoning_effort,
         "blocker_state": t.blocker_state,
         "repository_identity": t.repository_identity,
         "approved_base": t.approved_base,
@@ -418,6 +421,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                f"(default {kb.DEFAULT_FAILURE_LIMIT}).")
     p_create.add_argument("--task-scope", choices=['scratch', 'repository'])
     p_create.add_argument("--execution-authority", help="Task-specific approval reference")
+    p_revise = sub.add_parser('revise', help='Revise inactive draft requirements and revoke execution authority')
+    p_revise.add_argument('task_id')
+    p_revise.add_argument('--title')
+    p_revise.add_argument('--body')
+    p_prepare_set = sub.add_parser('prepare-set', help='Prepare all repositories for an inactive card')
+    p_prepare_set.add_argument('task_id')
+    p_prepare_set.add_argument('--manifest', required=True, help='Workspace set JSON file')
     p_prepare = sub.add_parser('prepare', help='Prepare an inactive repository card')
     p_prepare.add_argument('task_id')
     p_prepare.add_argument('--repository', required=True)
@@ -429,6 +439,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_authorise = sub.add_parser('authorise', help='Record task-specific execution authority')
     p_authorise.add_argument('task_id')
     p_authorise.add_argument('--authority', required=True)
+    p_authorise.add_argument('--publication-plan', help='JSON file mapping repository identity to authorised actions')
     p_authorise.add_argument('--publication-action', action='append',
                             choices=['commit', 'push', 'pull_request', 'merge', 'verify'])
     p_merge_check = sub.add_parser('merge-check', help='Retain a fresh CI and authority decision before a conditional merge')
@@ -524,6 +535,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_show = sub.add_parser("show", help="Show a task with comments + events")
     p_show.add_argument("task_id")
     p_show.add_argument("--json", action="store_true")
+    p_show.add_argument("--validate-workspace", action="store_true", help="Validate every registered repository member")
     p_show.add_argument(
         "--state-type",
         choices=("status", "outcome"),
@@ -1186,6 +1198,8 @@ def kanban_command(args: argparse.Namespace) -> int:
             "init":     _cmd_init,
             "create":   _cmd_create,
             "prepare": _cmd_prepare,
+            "prepare-set": _cmd_prepare_set,
+            "revise": _cmd_revise,
             "authorise": _cmd_authorise,
             "recover": _cmd_recover,
             "merge-check": _cmd_merge_check,
@@ -1266,6 +1280,8 @@ def _profile_author() -> str:
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "init",
     "prepare",
+    "prepare-set",
+    "revise",
     "authorise",
     "recover",
     "merge-check",
@@ -1704,6 +1720,21 @@ def _cmd_recover(args):
     return 0
 
 
+def _cmd_revise(args):
+    with kb.connect_closing() as conn:
+        task = kb.revise_task_requirements(conn, args.task_id, title=args.title, body=args.body)
+        print(json.dumps(_task_to_dict(task), indent=2))
+    return 0
+
+
+def _cmd_prepare_set(args):
+    from hermes_cli.kanban_workspace_set import prepare
+    with kb.connect_closing() as conn:
+        task = prepare(conn, args.task_id, json.loads(Path(args.manifest).read_text()))
+        print(json.dumps(_task_to_dict(task), indent=2))
+    return 0
+
+
 def _cmd_prepare(args):
     from hermes_cli.kanban_admission import prepare
     with kb.connect_closing() as conn:
@@ -1716,7 +1747,8 @@ def _cmd_authorise(args):
     from hermes_cli.kanban_admission import authorise
     with kb.connect_closing() as conn:
         task = authorise(conn, args.task_id, args.authority,
-                         publication_actions=getattr(args, 'publication_action', None))
+                         publication_actions=(json.loads(Path(args.publication_plan).read_text())
+                                              if getattr(args, 'publication_plan', None) else getattr(args, 'publication_action', None)))
         print(json.dumps(_task_to_dict(task), indent=2))
     return 0
 
@@ -1882,6 +1914,9 @@ def _cmd_show(args: argparse.Namespace) -> int:
         if not task:
             print(f"no such task: {args.task_id}", file=sys.stderr)
             return 1
+        if getattr(args, 'validate_workspace', False):
+            from hermes_cli.kanban_admission import validate_repository
+            validate_repository(task)
         comments = kb.list_comments(conn, args.task_id)
         events = kb.list_events(conn, args.task_id)
         parents = kb.parent_ids(conn, args.task_id)

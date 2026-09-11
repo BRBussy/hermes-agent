@@ -43,6 +43,11 @@ def retain(task):
     """Keep existing locks and add a persistent Git lock to an admitted tree."""
     from hermes_cli import kanban_db as kb
 
+    if getattr(task, 'workspace_set', None):
+        from hermes_cli.kanban_workspace_set import members
+        for member in members(task):
+            retain(member)
+        return
     path = Path(task.workspace_path)
     git_dir = kb._git_dir(path)
     if git_dir is None or not kb._is_linked_worktree_checkout(path):

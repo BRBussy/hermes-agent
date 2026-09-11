@@ -77,6 +77,9 @@ def reconcile(conn, task_id):
     if active_worker_exists(conn, task_id):
         raise ValueError('A worker still owns this card')
     validate_repository(task)
+    if task.workspace_set:
+        from hermes_cli.kanban_workspace_set import reconcile as reconcile_set
+        return reconcile_set(conn, task)
     failure = latest_failure(conn, task_id)
     if not failure:
         raise ValueError('Card has no failed attempt to reconcile')

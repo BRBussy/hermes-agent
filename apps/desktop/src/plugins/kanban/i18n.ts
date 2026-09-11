@@ -9,6 +9,35 @@ import { type PluginLocaleBundles, type PluginTranslate, usePluginI18n } from '@
 import { useMemo } from 'react'
 
 type KanbanMessages = {
+  boardWorkspaceHelp: string
+  inspectWorkspace: string
+  serverIdentity: string
+  accessChecks: string
+  publicationNeedsAuthority: string
+  temporaryOutput: string
+  accessReady: string
+  preparationRequired: string
+  cloneAuthority: string
+  prepareCheckout: string
+  linkConsumer: string
+  linkDependency: string
+  linkPackage: string
+  addLink: string
+  prepareDraft: string
+  draftHelp: string
+  idempotencyKey: string
+  repositoryIdentity: string
+  approvedBase: string
+  taskBranch: string
+  requiredRepositoryReview: string
+  prepareWorkspaces: string
+  executionAuthority: string
+  authoriseExecution: string
+  addRepository: string
+  primaryCheckout: string
+  packageManagerVersion: string
+  integrationCommands: string
+
   nav: string
   openBoard: string
   /** Command label — shows in the ⌘K palette AND as the keybind panel row,
@@ -212,6 +241,35 @@ type KanbanMessages = {
 }
 
 export const en: KanbanMessages = {
+  boardWorkspaceHelp: "Blank fields give each task a temporary workspace. An ordinary directory is shared output. A Git checkout supplies separate task worktrees. Creating a board starts no worker.",
+  inspectWorkspace: "Inspect server workspace",
+  serverIdentity: "Server",
+  accessChecks: "Account access",
+  publicationNeedsAuthority: "Publication requires separate authority for each repository.",
+  temporaryOutput: "Temporary task output",
+  accessReady: "Checks passed",
+  preparationRequired: "Preparation required",
+  cloneAuthority: "Explicit authority to clone this repository",
+  prepareCheckout: "Prepare approved checkout",
+  linkConsumer: "Consumer repository",
+  linkDependency: "Dependency repository",
+  linkPackage: "Package name",
+  addLink: "Add dependency link",
+  prepareDraft: "Prepare task draft",
+  draftHelp: "Drafts await explicit execution authority. Model and effort inherit the assigned profile. Publication needs separate authority.",
+  idempotencyKey: "Idempotency key",
+  repositoryIdentity: "Repository (organisation/name)",
+  approvedBase: "Approved exact base commit",
+  taskBranch: "Task branch",
+  requiredRepositoryReview: "Independent review is required for every repository.",
+  prepareWorkspaces: "Prepare retained workspaces",
+  executionAuthority: "Task-specific execution authority",
+  authoriseExecution: "Authorise prepared task execution",
+  addRepository: "Add repository",
+  primaryCheckout: "Primary checkout path on the server",
+  packageManagerVersion: "Package manager and exact version",
+  integrationCommands: "Integration test commands (one per line)",
+
   nav: 'Kanban',
   openBoard: 'Kanban: Open board',
   newTaskCommand: 'Kanban: New task',
@@ -424,6 +482,35 @@ export const en: KanbanMessages = {
 }
 
 const ja: KanbanMessages = {
+  boardWorkspaceHelp: "空欄の場合、各タスクに一時作業場所を用意します。通常のディレクトリは共有出力先です。Git リポジトリではタスク別の作業ツリーを使います。ボード作成ではワーカーは起動しません。",
+  inspectWorkspace: "サーバー作業場所を確認",
+  serverIdentity: "サーバー",
+  accessChecks: "アカウントのアクセス権",
+  publicationNeedsAuthority: "公開には各リポジトリへの個別の許可が必要です。",
+  temporaryOutput: "一時的なタスク出力",
+  accessReady: "確認済み",
+  preparationRequired: "準備が必要",
+  cloneAuthority: "このリポジトリの複製に対する明示的な許可",
+  prepareCheckout: "許可された作業コピーを準備",
+  linkConsumer: "利用側リポジトリ",
+  linkDependency: "依存先リポジトリ",
+  linkPackage: "パッケージ名",
+  addLink: "依存リンクを追加",
+  prepareDraft: "タスクの下書きを準備",
+  draftHelp: "下書きの実行には明示的な許可が必要です。モデルと推論設定は担当プロファイルを継承します。公開には別の許可が必要です。",
+  idempotencyKey: "冪等性キー",
+  repositoryIdentity: "リポジトリ（組織/名前）",
+  approvedBase: "承認済みの正確なベースコミット",
+  taskBranch: "タスクブランチ",
+  requiredRepositoryReview: "各リポジトリに独立したレビューが必要です。",
+  prepareWorkspaces: "保持するワークスペースを準備",
+  executionAuthority: "このタスクの実行許可",
+  authoriseExecution: "準備したタスクの実行を許可",
+  addRepository: "リポジトリを追加",
+  primaryCheckout: "サーバー上の主チェックアウトパス",
+  packageManagerVersion: "パッケージマネージャーと正確なバージョン",
+  integrationCommands: "統合テストコマンド（1行に1つ）",
+
   nav: 'カンバン',
   openBoard: 'カンバン: ボードを開く',
   newTaskCommand: 'カンバン: 新しいタスク',
@@ -635,6 +722,35 @@ const ja: KanbanMessages = {
 }
 
 const zh: KanbanMessages = {
+  boardWorkspaceHelp: "留空时，每个任务使用临时工作区。普通目录用于共享输出。Git 仓库为每个任务提供独立工作树。创建看板不会启动工作进程。",
+  inspectWorkspace: "检查服务器工作区",
+  serverIdentity: "服务器",
+  accessChecks: "账户访问权限",
+  publicationNeedsAuthority: "发布需要对每个仓库单独授权。",
+  temporaryOutput: "任务临时输出",
+  accessReady: "检查通过",
+  preparationRequired: "需要准备",
+  cloneAuthority: "克隆此仓库的明确授权",
+  prepareCheckout: "准备已授权的检出",
+  linkConsumer: "使用方仓库",
+  linkDependency: "依赖仓库",
+  linkPackage: "包名",
+  addLink: "添加依赖链接",
+  prepareDraft: "准备任务草稿",
+  draftHelp: "草稿需要明确的执行授权。模型和推理设置继承分配的配置。发布需要单独授权。",
+  idempotencyKey: "幂等键",
+  repositoryIdentity: "仓库（组织/名称）",
+  approvedBase: "已批准的确切基础提交",
+  taskBranch: "任务分支",
+  requiredRepositoryReview: "每个仓库都需要独立审查。",
+  prepareWorkspaces: "准备持久工作区",
+  executionAuthority: "此任务的执行授权",
+  authoriseExecution: "授权执行已准备的任务",
+  addRepository: "添加仓库",
+  primaryCheckout: "服务器上的主检出路径",
+  packageManagerVersion: "包管理器和确切版本",
+  integrationCommands: "集成测试命令（每行一个）",
+
   nav: '看板',
   openBoard: '看板：打开面板',
   newTaskCommand: '看板：新建任务',
@@ -843,6 +959,35 @@ const zh: KanbanMessages = {
 }
 
 const zhHant: KanbanMessages = {
+  boardWorkspaceHelp: "留空時，每個任務使用臨時工作區。一般目錄用於共用輸出。Git 儲存庫為每個任務提供獨立工作樹。建立看板不會啟動工作程序。",
+  inspectWorkspace: "檢查伺服器工作區",
+  serverIdentity: "伺服器",
+  accessChecks: "帳戶存取權限",
+  publicationNeedsAuthority: "發佈需要對每個儲存庫單獨授權。",
+  temporaryOutput: "任務臨時輸出",
+  accessReady: "檢查通過",
+  preparationRequired: "需要準備",
+  cloneAuthority: "複製此儲存庫的明確授權",
+  prepareCheckout: "準備已授權的工作副本",
+  linkConsumer: "使用方儲存庫",
+  linkDependency: "相依儲存庫",
+  linkPackage: "套件名稱",
+  addLink: "新增相依連結",
+  prepareDraft: "準備任務草稿",
+  draftHelp: "草稿需要明確的執行授權。模型和推理設定繼承指派的設定檔。發佈需要單獨授權。",
+  idempotencyKey: "冪等鍵",
+  repositoryIdentity: "儲存庫（組織/名稱）",
+  approvedBase: "已批准的確切基礎提交",
+  taskBranch: "任務分支",
+  requiredRepositoryReview: "每個儲存庫都需要獨立審查。",
+  prepareWorkspaces: "準備持久工作區",
+  executionAuthority: "此任務的執行授權",
+  authoriseExecution: "授權執行已準備的任務",
+  addRepository: "新增儲存庫",
+  primaryCheckout: "伺服器上的主要檢出路徑",
+  packageManagerVersion: "套件管理器和確切版本",
+  integrationCommands: "整合測試命令（每行一個）",
+
   nav: '看板',
   openBoard: '看板：開啟面板',
   newTaskCommand: '看板：新增任務',

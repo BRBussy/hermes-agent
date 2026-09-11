@@ -266,7 +266,7 @@ def notify_task_updated(
     a task row outside the claim/complete/block lifecycle calls this AFTER
     its write txn has committed — including surfaces that write with direct
     SQL and bypass every ``kanban_db`` mutator (the dashboard plugin API's
-    priority/title/body editors). ``changed_fields`` carries field NAMES
+    priority editor). ``changed_fields`` carries field NAMES
     only, never values. Observer-only and fully best-effort: it can never
     fail a task mutation, and it costs one ``has_hook`` probe when nothing
     subscribes.
@@ -924,27 +924,37 @@ def create_board(
     default_workdir: Optional[str] = None,
     project_id: Optional[str] = None,
 ) -> dict:
-    """Create a new board directory + DB + metadata. Idempotent.
-
-    Returns the resulting metadata. Raises :class:`ValueError` for a
-    malformed slug; returns the existing metadata (not an error) if the
-    board already exists — matching ``mkdir -p`` semantics.
-    """
+    """Create a board or reuse matching settings without changing an existing board."""
     normed = _normalize_board_slug(slug)
     if not normed:
         raise ValueError("board slug is required")
-    meta = write_board_metadata(
-        normed,
-        name=name,
-        description=description,
-        icon=icon,
-        color=color,
-        default_workdir=default_workdir,
-        project_id=project_id,
-    )
-    # Touch the DB so list_boards() sees it immediately.
-    init_db(board=normed)
-    return meta
+    from hermes_cli import auth
+    directory = boards_root()
+    directory.mkdir(parents=True, exist_ok=True)
+    lock = _checked_worktree_path(directory / ('.create-' + normed + '.lock'))
+    with auth._file_lock(lock, threading.local(), 120, 'Board creation is busy'):
+        if board_exists(normed):
+            existing = read_board_metadata(normed)
+            for key, value in {'name': name, 'description': description, 'icon': icon,
+                               'color': color, 'default_workdir': default_workdir,
+                               'project_id': project_id}.items():
+                if value is not None and value != existing.get(key):
+                    raise ValueError('Board already exists with different settings. Reuse it or edit its settings explicitly')
+            return existing
+        if default_workdir:
+            from hermes_cli.kanban_onboarding import inspect_directory
+            default_workdir = inspect_directory(default_workdir)['path']
+        meta = write_board_metadata(
+            normed,
+            name=name,
+            description=description,
+            icon=icon,
+            color=color,
+            default_workdir=default_workdir,
+            project_id=project_id,
+        )
+        init_db(board=normed)
+        return meta
 
 
 def list_boards(*, include_archived: bool = True) -> list[dict]:
@@ -1071,6 +1081,7 @@ class Task:
     task_scope: str = 'scratch'
     execution_authority: Optional[str] = None
     publication: Optional[dict] = None
+    workspace_set: Optional[dict] = None
     repository_identity: Optional[str] = None
     approved_base: Optional[str] = None
     branch_name: Optional[str] = None
@@ -1172,6 +1183,7 @@ class Task:
             task_scope=row['task_scope'] if 'task_scope' in keys else 'scratch',
             execution_authority=row['execution_authority'] if 'execution_authority' in keys else None,
             publication=json.loads(row['publication']) if 'publication' in keys and row['publication'] else None,
+            workspace_set=json.loads(row['workspace_set']) if 'workspace_set' in keys and row['workspace_set'] else None,
             repository_identity=row['repository_identity'] if 'repository_identity' in keys else None,
             approved_base=row['approved_base'] if 'approved_base' in keys else None,
             branch_name=row["branch_name"] if "branch_name" in keys else None,
@@ -2605,6 +2617,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         ('task_scope', "task_scope TEXT NOT NULL DEFAULT 'scratch'"),
         ('execution_authority', 'execution_authority TEXT'),
         ('publication', 'publication TEXT'),
+        ('workspace_set', 'workspace_set TEXT'),
         ('repository_identity', 'repository_identity TEXT'),
         ('approved_base', 'approved_base TEXT'),
     ):
@@ -3411,21 +3424,6 @@ def create_task(
             )
         skills_list = cleaned
 
-    # Idempotency check — return the existing task instead of creating a
-    # duplicate. Done BEFORE entering write_txn to keep the fast path fast
-    # and to avoid holding a write lock during the lookup. Race is
-    # acceptable: two concurrent creators with the same key might both
-    # insert, at which point both rows exist but the next lookup stabilises.
-    if idempotency_key:
-        row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? "
-            "AND status != 'archived' "
-            "ORDER BY created_at DESC LIMIT 1",
-            (idempotency_key,),
-        ).fetchone()
-        if row:
-            return row["id"]
-
     if not isinstance(review_required, bool):
         raise ValueError("review_required must be a boolean")
     if review_required and workspace_kind == "scratch":
@@ -3460,6 +3458,10 @@ def create_task(
             # compose create_task calls under one outer commit so the
             # dispatcher can never observe a partially constructed graph.
             with write_txn(conn, allow_nested=True):
+                if idempotency_key:
+                    existing = conn.execute("SELECT id FROM tasks WHERE idempotency_key = ? AND status != 'archived' ORDER BY created_at DESC LIMIT 1", (idempotency_key,)).fetchone()
+                    if existing:
+                        return existing['id']
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
@@ -6078,6 +6080,34 @@ def _maybe_emit_scratch_tip(
         pass
     finally:
         _mark_scratch_tip_shown()
+
+
+def revise_task_requirements(conn, task_id, *, title=None, body=None, board=None):
+    """Revise an inactive draft and require fresh execution authority."""
+    from hermes_cli.kanban_admission import _operator
+    from hermes_cli.kanban_worker import active_worker_exists
+    _operator()
+    if title is None and body is None:
+        raise ValueError('Supply a title or description')
+    if title is not None and not title.strip():
+        raise ValueError('Title cannot be empty')
+    fields = [name for name, value in {'title': title, 'body': body}.items() if value is not None]
+    with write_txn(conn):
+        task = get_task(conn, task_id)
+        if not task:
+            raise ValueError('Task does not exist')
+        if (task.current_run_id or task.claim_lock or active_worker_exists(conn, task_id)
+                or task.status in {'running', 'review', 'done', 'archived'}):
+            raise ValueError('Reopen an inactive draft before revising its requirements')
+        updates = {'title': task.title if title is None else title.strip(),
+                   'body': task.body if body is None else body}
+        if updates == {'title': task.title, 'body': task.body}:
+            return task
+        conn.execute('UPDATE tasks SET title = ?, body = ?, execution_authority = NULL WHERE id = ?',
+                     (updates['title'], updates['body'], task_id))
+        _append_event(conn, task_id, 'edited', {'fields': fields, 'execution_authority_revoked': True})
+    notify_task_updated(conn, task_id, fields, board=board)
+    return get_task(conn, task_id)
 
 
 def edit_completed_task_result(
@@ -10909,6 +10939,10 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
         submission = latest_submission(conn, task.id)
         if submission:
             lines.append(f"Submitted review state: {submission['state']['id']}")
+            if task.workspace_set:
+                lines.append('Submitted repository states: ' + json.dumps({
+                    identity: state['id'] for identity, state in submission['state']['repositories'].items()
+                }))
         lines.append("Use same-card review. The developer requests review after verification. "
                      "The reviewer records findings in comments, keeps deliverables unchanged, "
                      "and completes with metadata.review_outcome='approved', "
@@ -10919,6 +10953,9 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
                      "and the promised publication remains outstanding.")
     if task.tenant:
         lines.append(f"Tenant:   {task.tenant}")
+    if task.workspace_set:
+        lines.append('Task workspace set: ' + json.dumps(task.workspace_set))
+        lines.append('Every repository needs independent review of its exact state. Submit repository_checks keyed by repository identity, with reviewed_state_id and checks for each member. Keep dependency caches and links inside these task worktrees.')
     lines.append(f"Workspace: {task.workspace_kind} @ {task.workspace_path or '(unresolved)'}")
     if task.max_runtime_seconds is not None:
         terminal_timeout = _worker_terminal_timeout_env(

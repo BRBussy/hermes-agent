@@ -7,6 +7,11 @@ from hermes_cli.kanban_review import capture_state, completion_rejection, latest
 
 
 def same_content(accepted, current):
+    if accepted.get('repositories') or current.get('repositories'):
+        before, after = accepted.get('repositories', {}), current.get('repositories', {})
+        return (bool(before) and set(before) == set(after)
+                and accepted.get('workspace_set') == current.get('workspace_set')
+                and all(same_content(before[key], after[key]) for key in before))
     return all(accepted.get(key) == current.get(key) for key in (
         "workspace", "branch", "requirements", "content_digest",
     )) and bool(accepted.get("content_digest"))
@@ -177,6 +182,9 @@ def authorise(conn, task, authority, actions):
 
 
 def verify_delivery(conn, task, metadata):
+    if getattr(task, 'workspace_set', None) and task.publication:
+        from hermes_cli.kanban_workspace_set import verify_publication
+        return verify_publication(conn, task, metadata)
     from hermes_cli.kanban_recovery import observe_publication
     publication = task.publication
     if not publication:

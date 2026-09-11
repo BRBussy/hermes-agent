@@ -155,6 +155,8 @@ def dispose(conn, task_id, *, request_id, authority, expected_head, remote, ref,
         raise ValueError('A safe, unique request identifier is required')
     if not re.fullmatch(r't_[0-9a-f]+', task_id or '') or kb.get_task(conn, task_id) is None:
         raise ValueError('Disposal requires an existing task identity')
+    if kb.get_task(conn, task_id).workspace_set:
+        raise ValueError('Workspace sets require a recovery plan covering every member before disposal')
     directory = evidence._directory(conn, task_id)
     kb._checked_worktree_path(directory)
     directory.mkdir(parents=True, mode=0o700, exist_ok=True)

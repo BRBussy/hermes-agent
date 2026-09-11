@@ -115,12 +115,14 @@ class CodexAppServerClient:
                     ),
                 )
             )
+            from hermes_cli.kanban_workspace_set import writable_roots
+            task_roots = writable_roots(spawn_env)
             app_server_args.extend(
                 [
                     "-c",
                     'sandbox_mode="workspace-write"',
                     "-c",
-                    f"sandbox_workspace_write.writable_roots={json.dumps([kanban_root])}",
+                    f"sandbox_workspace_write.writable_roots={json.dumps([kanban_root, *task_roots])}",
                     "-c",
                     f"sandbox_workspace_write.network_access={str(network_access).lower()}",
                 ]

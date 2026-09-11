@@ -1,11 +1,4 @@
-"""Dashboard mutation-boundary coverage for ``on_kanban_task_updated``.
-
-The dashboard plugin API's priority/title/body editors write task rows with
-direct SQL, bypassing every ``kanban_db`` mutator — the exact gap the RFC
-#58548 mutation-boundary review called out. These tests verify each
-direct-SQL write path (single-task PATCH and bulk POST) reports through
-``kanban_db.notify_task_updated`` with the right ``changed_fields``.
-"""
+"""Dashboard field mutations notify observers with changed field names."""
 
 from __future__ import annotations
 

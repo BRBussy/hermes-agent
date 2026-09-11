@@ -498,6 +498,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "execution_authority": task.execution_authority,
         "publication": task.publication,
         "blocker_state": task.blocker_state,
+        "workspace_set": task.workspace_set,
         "repository_identity": task.repository_identity,
         "approved_base": task.approved_base,
         "workspace_kind": task.workspace_kind,

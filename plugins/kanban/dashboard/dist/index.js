@@ -80,7 +80,7 @@
       const parsed = JSON.parse(body);
       if (parsed && typeof parsed.detail === "string") return parsed.detail;
       if (parsed && parsed.detail && typeof parsed.detail.message === "string") {
-        return parsed.detail.message;
+        return parsed.detail.message + (parsed.detail.task_id ? " Retained card: " + parsed.detail.task_id + ". " + (parsed.detail.recovery || "Open this card to continue preparation.") : "");
       }
     } catch (_e) { /* not JSON — fall through to raw body */ }
     return body || raw;
@@ -2176,6 +2176,32 @@
     const [description, setDescription] = useState("");
     const [icon, setIcon] = useState("");
     const [projectDirectory, setProjectDirectory] = useState("");
+    const [repository, setRepository] = useState("");
+    const [repositories, setRepositories] = useState([]);
+    const [inspection, setInspection] = useState(null);
+    const selectionGeneration = useRef(0);
+    const [cloneAuthority, setCloneAuthority] = useState("");
+    useEffect(function () {
+      SDK.fetchJSON(API + "/repositories").then(function (result) {
+        setRepositories(result.repositories || []);
+      }).catch(function (error) { setErr(parseApiErrorMessage(error)); });
+    }, []);
+    function inspectSelection(prepare) {
+      const generation = ++selectionGeneration.current;
+      setSubmitting(true);
+      SDK.fetchJSON(API + (prepare ? "/repositories/prepare" : "/repositories/inspect"), {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ repository: repository.trim() || undefined,
+                               path: projectDirectory.trim() || undefined,
+                               clone_authority: prepare ? cloneAuthority.trim() : undefined }),
+      }).then(function (result) {
+        if (generation !== selectionGeneration.current) return;
+        setInspection(result);
+        if (result.ready) setProjectDirectory(result.path);
+        setErr(null);
+      }).catch(function (error) { setErr(parseApiErrorMessage(error)); })
+        .finally(function () { setSubmitting(false); });
+    }
     const [switchTo, setSwitchTo] = useState(true);
     const [submitting, setSubmitting] = useState(false);
     const [err, setErr] = useState(null);
@@ -2201,9 +2227,10 @@
         description: description.trim() || undefined,
         icon: icon.trim() || undefined,
         default_workdir: projectDirectory.trim() || undefined,
+        repository: repository.trim() || undefined,
         switch: switchTo,
       }).catch(function (e) {
-        setErr(String(e && e.message ? e.message : e));
+        setErr(parseApiErrorMessage(e));
         setSubmitting(false);
       });
     }
@@ -2257,13 +2284,31 @@
             }),
           ),
           h("div", { className: "flex flex-col gap-1" },
+            h(Label, { className: "text-xs" }, "Repository (organisation/name)"),
+            h(Input, { value: repository, list: "onboarding-repositories",
+              onChange: function (e) { setRepository(e.target.value); setInspection(null); selectionGeneration.current += 1; },
+              placeholder: "Organisation/repository" }),
+            h("datalist", { id: "onboarding-repositories" }, repositories.map(function (entry) {
+              return h("option", { key: entry.repository, value: entry.repository });
+            })),
+            h(Button, { type: "button", disabled: submitting, onClick: function () { inspectSelection(false); } }, "Inspect server location"),
+            inspection ? h("div", { className: "text-xs" },
+              "Server: " + inspection.server + " | Path: " + (inspection.path || "temporary task workspace") +
+              " | Type: " + (inspection.kind || "repository") + " | Repository: " + (inspection.repository || "none") +
+              " | Access: " + (inspection.kind === "scratch" ? "temporary task output" : inspection.ready || inspection.writable ? "account checks passed" : "preparation required")) : null,
+            inspection && inspection.exists === false ? h("div", null,
+              h(Label, { className: "text-xs" }, "Authority for this repository clone"),
+              h(Input, { value: cloneAuthority, onChange: function (e) { setCloneAuthority(e.target.value); }, placeholder: "Record the operator's explicit Git approval" }),
+              h(Button, { type: "button", disabled: submitting || !cloneAuthority.trim(), onClick: function () { inspectSelection(true); } }, "Prepare approved checkout")) : null,
+            h("p", { className: "text-xs text-muted-foreground" }, "A blank location selects temporary task output. An ordinary directory is shared output. A repository uses separate persistent task worktrees. Creating a board launches no worker.")),
+          h("div", { className: "flex flex-col gap-1" },
             h(Label, { className: "text-xs" },
               tx(t, "projectDirectory", "Project directory"), " ",
               h("span", { className: "text-muted-foreground" },
                 tx(t, "projectDirectoryHint", "(recommended)"))),
             h(Input, {
               value: projectDirectory,
-              onChange: function (e) { setProjectDirectory(e.target.value); },
+              onChange: function (e) { setProjectDirectory(e.target.value); setInspection(null); selectionGeneration.current += 1; },
               placeholder: tx(t, "projectDirectoryPlaceholder",
                 "Absolute path to the project folder"),
               title: tx(t, "projectDirectoryHelp",
@@ -2307,7 +2352,7 @@
           h(Button, {
             type: "submit",
             size: "sm",
-            disabled: submitting || !slug.trim(),
+            disabled: submitting || !slug.trim() || !inspection || (repository.trim() && !inspection.ready),
           }, submitting ? tx(t, "creating", "Creating…") : tx(t, "createBoard", "Create board")),
         ),
       ),
@@ -2923,7 +2968,7 @@
         defaultWorkspaceKind: (props.boardMeta && props.boardMeta.default_workspace_kind) || "scratch",
         defaultWorkspacePath: (props.boardMeta && props.boardMeta.default_workdir) || "",
         onSubmit: function (body) {
-          props.onCreate(body).then(function () { setShowCreate(false); });
+          return props.onCreate(body).then(function () { setShowCreate(false); });
         },
         onCancel: function () { setShowCreate(false); },
       }) : null,
@@ -3164,7 +3209,14 @@
 
   function InlineCreate(props) {
     const { t } = useI18n();
+    const [submitting, setSubmitting] = useState(false);
+    const [creationError, setCreationError] = useState(null);
     const [title, setTitle] = useState("");
+    const [description, setDescription] = useState("");
+    const [branch, setBranch] = useState("");
+    const [repository, setRepository] = useState("");
+    const [base, setBase] = useState("");
+    const [idempotencyKey, setIdempotencyKey] = useState(function () { return "dashboard-" + crypto.randomUUID(); });
     const [assignee, setAssignee] = useState("");
     const [priority, setPriority] = useState(0);
     const [parent, setParent] = useState("");
@@ -3189,6 +3241,13 @@
       if (!trimmed) return;
       const body = {
         title: trimmed,
+        body: description,
+        idempotency_key: idempotencyKey.trim(),
+        branch_name: workspaceKind === "worktree" ? branch.trim() || undefined : undefined,
+        repository: workspaceKind === "worktree" ? repository.trim() || undefined : undefined,
+        approved_base: workspaceKind === "worktree" ? base.trim() || undefined : undefined,
+        review_required: workspaceKind === "worktree",
+        execution_authority: null,
         assignee: assignee.trim() || null,
         priority: Number(priority) || 0,
         triage: props.columnName === "triage",
@@ -3216,10 +3275,13 @@
         const gmt = parseInt(goalMaxTurns, 10);
         if (Number.isFinite(gmt) && gmt > 0) body.goal_max_turns = gmt;
       }
-      props.onSubmit(body);
-      setTitle(""); setAssignee(""); setPriority(0); setParent(""); setSkills("");
-      setWorkspaceKind(defaultWorkspaceKind); setWorkspacePath(defaultWorkspacePath);
-      setGoalMode(false); setGoalMaxTurns("");
+      if (submitting) return;
+      setSubmitting(true);
+      setCreationError(null);
+      return props.onSubmit(body).catch(function (error) {
+        setCreationError(parseApiErrorMessage(error));
+      }).finally(function () { setSubmitting(false); });
+
     };
 
     const showPathInput = workspaceKind !== "scratch";
@@ -3243,8 +3305,8 @@
         onSubmit: function (e) { e.preventDefault(); submit(); },
       },
         h("div", { className: "hermes-kanban-dialog-title" },
-          tx(t, "newTaskTitle", "New task — {column}",
-            { column: getColumnLabel(t, props.columnName) || props.columnName })),
+          "Prepare task draft"),
+        h("p", { className: "text-xs text-muted-foreground" }, "Saved drafts have no execution authority. Review the complete card, workspaces and publication scope before authorising execution. Model and effort inherit the assigned profile."),
         h("div", { className: "flex flex-col gap-3" },
           h("div", { className: "flex flex-col gap-1" },
             fieldLabel(tx(t, "taskTitleLabel", "Title")),
@@ -3262,6 +3324,20 @@
               rows: 3,
             }),
           ),
+          h("div", { className: "flex flex-col gap-1" },
+            fieldLabel("Complete description and acceptance criteria"),
+            h("textarea", { value: description, rows: 7, className: "w-full border rounded-md p-2",
+              onChange: function (e) { setDescription(e.target.value); } }),
+            fieldLabel("Idempotency key"),
+            h(Input, { value: idempotencyKey, onChange: function (e) { setIdempotencyKey(e.target.value); } })),
+          workspaceKind === "worktree" ? h("div", { className: "flex flex-col gap-1" },
+            fieldLabel("Repository (organisation/name)"),
+            h(Input, { value: repository, onChange: function (e) { setRepository(e.target.value); } }),
+            fieldLabel("Approved exact base commit"),
+            h(Input, { value: base, onChange: function (e) { setBase(e.target.value); } }),
+            fieldLabel("Task branch"),
+            h(Input, { value: branch, onChange: function (e) { setBranch(e.target.value); } }),
+            h("p", { className: "text-xs" }, "Independent review is required for repository work.")) : null,
           h("div", { className: "flex gap-2" },
             h("div", { className: "flex flex-col gap-1 flex-1" },
               fieldLabel(props.columnName === "triage"
@@ -3375,6 +3451,7 @@
             }) : null,
           ),
         ),
+        creationError ? h("p", { role: "alert", className: "text-xs text-destructive" }, creationError) : null,
         h("div", { className: "hermes-kanban-dialog-actions" },
           h(Button, {
             type: "button",
@@ -3384,7 +3461,7 @@
           h(Button, {
             type: "submit",
             size: "sm",
-            disabled: !title.trim(),
+            disabled: submitting || !title.trim(),
           }, tx(t, "create", "Create")),
         ),
       ),
@@ -3867,6 +3944,98 @@
     );
   }
 
+  function TaskPreparation(props) {
+    const task = props.task;
+    const saved = task.workspace_set;
+    const initial = saved ? saved.repositories.map(function (entry) {
+      return { repository: entry.repository, path: entry.path, base: entry.base, branch: entry.branch };
+    }) : [{ repository: (task.repository_identity || "").replace(/^github.com\//, ""),
+            path: task.repository_identity ? task.workspace_path.split("/.worktrees/")[0] : task.workspace_path || "",
+            base: task.approved_base || "", branch: task.branch_name || "" }];
+    const [rows, setRows] = useState(initial);
+    const [manager, setManager] = useState(saved && saved.package_manager || "");
+    const [commands, setCommands] = useState(saved ? saved.test_commands.join("\n") : "");
+    const [links, setLinks] = useState(saved && saved.links || []);
+    const [authority, setAuthority] = useState("");
+    const [busy, setBusy] = useState(false);
+    const [error, setError] = useState(null);
+    function request(action, body) {
+      setBusy(true); setError(null);
+      SDK.fetchJSON(withBoard(API + "/tasks/" + encodeURIComponent(task.id) + "/" + action, props.boardSlug), {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+      }).then(function () { return props.onRefresh(); })
+        .catch(function (e) { setError(parseApiErrorMessage(e)); })
+        .finally(function () { setBusy(false); });
+    }
+    function field(label, value, onChange) {
+      return h("label", { className: "flex flex-col gap-1 text-xs" }, label,
+        h(Input, { value: value, onChange: function (e) { onChange(e.target.value); }, disabled: busy }));
+    }
+    function updateRow(index, key, value) {
+      setRows(rows.map(function (row, i) { return i === index ? Object.assign({}, row, { [key]: value }) : row; }));
+    }
+    const inactive = !task.current_run_id && !task.claim_lock && ["running", "done", "archived"].indexOf(task.status) < 0;
+    return h("section", { className: "hermes-kanban-section flex flex-col gap-2" },
+      h("h3", { className: "hermes-kanban-section-head" }, "Workspace preparation and authority"),
+      h("p", { className: "text-xs" }, "Execution: " + (task.execution_authority || "draft, awaiting authority") +
+        ". Independent review: " + (task.review_required ? "required" : "not prepared") +
+        ". Model: " + (task.model_override || "assigned profile") + ". Effort: " + (task.reasoning_effort || "assigned profile") +
+        ". Publication: " + (task.publication ? task.publication.phase : "requires separate authority") + "."),
+      task.publication && task.publication.repositories ? Object.entries(task.publication.repositories).map(function (entry) {
+        return h("p", { key: entry[0], className: "text-xs break-all" }, entry[0] + ": " +
+          (entry[1].authority || "awaiting authority") + ". Outstanding actions: " + (entry[1].actions.join(", ") || "none") + ".");
+      }) : null,
+      saved ? saved.repositories.map(function (entry) {
+        return h("p", { key: entry.repository, className: "text-xs font-mono break-all" },
+          entry.repository + ": " + entry.workspace_path + " | " + entry.branch + " | base " + entry.base);
+      }) : null,
+      inactive ? h("div", { className: "flex flex-col gap-2" },
+        rows.map(function (row, index) {
+          return h("fieldset", { key: index, className: "border rounded p-2 flex flex-col gap-1" },
+            h("legend", null, index === 0 ? "Primary repository" : "Additional repository"),
+            field("Repository (organisation/name)", row.repository, function (v) { updateRow(index, "repository", v); }),
+            field("Primary checkout path on the server", row.path, function (v) { updateRow(index, "path", v); }),
+            field("Approved exact base commit", row.base, function (v) { updateRow(index, "base", v); }),
+            field("Task branch", row.branch, function (v) { updateRow(index, "branch", v); }));
+        }),
+        h(Button, { type: "button", disabled: busy || !!saved, onClick: function () {
+          setRows(rows.concat([{ repository: "", path: "", base: "", branch: "" }]));
+        } }, "Add repository"),
+        rows.length > 1 ? h("div", { className: "flex flex-col gap-1" },
+          field("Package manager and exact version", manager, setManager),
+          h("label", { className: "text-xs" }, "Integration test commands (one per line)",
+            h("textarea", { className: "w-full border rounded p-2", value: commands, rows: 3,
+              onChange: function (e) { setCommands(e.target.value); } })),
+          links.map(function (link, index) {
+            function change(key, value) {
+              setLinks(links.map(function (entry, i) { return i === index ? Object.assign({}, entry, { [key]: value }) : entry; }));
+            }
+            return h("fieldset", { key: index, className: "border rounded p-2" },
+              h("legend", null, "Project-local dependency link"),
+              field("Consumer repository", link.consumer, function (v) { change("consumer", v); }),
+              field("Dependency repository", link.dependency, function (v) { change("dependency", v); }),
+              field("Package name", link.package, function (v) { change("package", v); }));
+          }),
+          h(Button, { type: "button", disabled: busy, onClick: function () {
+            setLinks(links.concat([{ consumer: "", dependency: "", package: "" }]));
+          } }, "Add dependency link")) : null,
+        h(Button, { type: "button", disabled: busy, onClick: function () {
+          if (rows.length === 1 && !saved) {
+            request("prepare", { repository: rows[0].repository, repository_path: rows[0].path,
+                                 base: rows[0].base, branch: rows[0].branch });
+          } else {
+            request("prepare-set", { manifest: { repositories: rows, links: links, package_manager: manager,
+                                                 test_commands: commands.split("\n").filter(function (v) { return v.trim(); }) } });
+          }
+        } }, "Prepare retained workspaces"),
+        field("Task-specific execution authority", authority, setAuthority),
+        h(Button, { type: "button", disabled: busy || !authority.trim() || !task.body || !task.review_required,
+          onClick: function () { request("authorise", { authority: authority.trim() }); }
+        }, "Authorise prepared task execution"),
+        h("p", { className: "text-xs" }, "Repository preparation preserves existing work. After an interruption, repeat the same preparation. Publication approval is recorded separately for every repository through the coordinator or CLI.")) : null,
+      error ? h("p", { role: "alert", className: "text-xs text-destructive" }, error) : null);
+  }
+
   function TaskDetail(props) {
     const { t: i18n } = useI18n();
     const t = props.data.task;
@@ -3933,6 +4102,7 @@
         homeBusy: props.homeBusy || {},
         onToggle: props.onToggleHomeSub,
       }),
+      h(TaskPreparation, { key: t.id, task: t, boardSlug: props.boardSlug, onRefresh: props.onRefresh }),
       h(BodyEditor, {
         task: t,
         renderMarkdown: props.renderMarkdown,

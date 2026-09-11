@@ -349,6 +349,11 @@ def _relocate_imported_rows(
                 _DISPATCHABLE_STATUSES,
             ).fetchall()
         ]
+        imported_sets = conn.execute('SELECT id, workspace_set FROM tasks WHERE workspace_set IS NOT NULL').fetchall()
+        for row in imported_sets:
+            kb._append_event(conn, row['id'], 'workspace_set_imported', json.loads(row['workspace_set']))
+        conn.execute("UPDATE tasks SET workspace_set = NULL, repository_identity = NULL, approved_base = NULL, "
+                     "execution_authority = NULL, publication = NULL WHERE workspace_set IS NOT NULL")
         conn.execute("UPDATE tasks SET workspace_path = NULL, branch_name = NULL")
         if parked:
             conn.execute(

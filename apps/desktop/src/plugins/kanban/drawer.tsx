@@ -46,6 +46,7 @@ import {
   uploadAttachment
 } from './api'
 import { ModelOverrideField, overridePatch } from './model-override'
+import { TaskPreparation } from './task-preparation'
 import {
   type Diagnostic,
   type DiagnosticAction,
@@ -798,6 +799,10 @@ export function TaskDrawer({
               </Section>
             )}
 
+            <TaskPreparation key={task.id} onSaved={async () => {
+              await qc.invalidateQueries({ queryKey: taskKey(slug, task.id) })
+              await qc.invalidateQueries({ queryKey: ['kanban', 'board'] })
+            }} task={task} />
             <DescriptionSection body={task.body} onSave={body => void mutate(() => patchTask(task.id, { body }))()} />
 
             <EstimateSection id={task.id} />

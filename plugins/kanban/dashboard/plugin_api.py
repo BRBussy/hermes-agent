@@ -43,6 +43,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
+import subprocess
 from typing import Any, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status
@@ -602,9 +603,105 @@ def get_task(
 # POST /tasks
 # ---------------------------------------------------------------------------
 
+class RepositoryInspectionBody(BaseModel):
+    repository: Optional[str] = None
+    path: Optional[str] = None
+    clone_authority: Optional[str] = None
+
+
+@router.get('/repositories')
+def repositories_endpoint():
+    from hermes_cli.kanban_onboarding import repository_helper
+    try:
+        return repository_helper('list')
+    except (ValueError, OSError, subprocess.SubprocessError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.post('/repositories/inspect')
+def inspect_repository_endpoint(payload: RepositoryInspectionBody):
+    from hermes_cli.kanban_onboarding import repository_helper, inspect_directory
+    try:
+        if payload.repository:
+            return repository_helper('inspect', payload.repository)
+        return inspect_directory(payload.path)
+    except (ValueError, OSError, subprocess.SubprocessError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.post('/repositories/prepare')
+def prepare_repository_endpoint(payload: RepositoryInspectionBody):
+    from hermes_cli.kanban_onboarding import repository_helper
+    try:
+        if not payload.repository:
+            raise ValueError('Repository identity is required')
+        return repository_helper('clone', payload.repository, authority=payload.clone_authority)
+    except (ValueError, OSError, subprocess.SubprocessError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+class PrepareWorkspaceSetBody(BaseModel):
+    manifest: dict
+
+
+@router.post('/tasks/{task_id}/prepare-set')
+def prepare_workspace_set_endpoint(task_id: str, payload: PrepareWorkspaceSetBody,
+                                   board: Optional[str] = Query(None)):
+    from hermes_cli.kanban_workspace_set import prepare
+    conn = _conn(board=_resolve_board(board))
+    try:
+        return {'task': _task_dict(prepare(conn, task_id, payload.manifest))}
+    except (ValueError, OSError, subprocess.SubprocessError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    finally:
+        conn.close()
+
+
+class PrepareRepositoryTaskBody(BaseModel):
+    repository: str
+    repository_path: str
+    base: str
+    branch: str
+
+
+@router.post('/tasks/{task_id}/prepare')
+def prepare_repository_task_endpoint(task_id: str, payload: PrepareRepositoryTaskBody,
+                                     board: Optional[str] = Query(None)):
+    from hermes_cli.kanban_admission import prepare
+    conn = _conn(board=_resolve_board(board))
+    try:
+        task = prepare(conn, task_id, payload.repository, payload.repository_path, payload.base, payload.branch)
+        return {'task': _task_dict(task)}
+    except (ValueError, OSError, subprocess.SubprocessError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    finally:
+        conn.close()
+
+
+class TaskAuthorityBody(BaseModel):
+    authority: str
+    publication_plan: Optional[dict] = None
+
+
+@router.post('/tasks/{task_id}/authorise')
+def authorise_task_endpoint(task_id: str, payload: TaskAuthorityBody,
+                            board: Optional[str] = Query(None)):
+    from hermes_cli.kanban_admission import authorise
+    conn = _conn(board=_resolve_board(board))
+    try:
+        return {'task': _task_dict(authorise(conn, task_id, payload.authority, publication_actions=payload.publication_plan))}
+    except (ValueError, PermissionError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    finally:
+        conn.close()
+
+
 class CreateTaskBody(BaseModel):
     task_scope: Optional[str] = None
     execution_authority: Optional[str] = None
+    branch_name: Optional[str] = None
+    repository: Optional[str] = None
+    approved_base: Optional[str] = None
     review_required: bool = False
     title: str
     body: Optional[str] = None
@@ -635,32 +732,67 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        task_id = kanban_db.create_task(
-            conn,
-            review_required=payload.review_required,
-            title=payload.title,
-            task_scope=payload.task_scope,
-            execution_authority=payload.execution_authority,
-            body=payload.body,
-            assignee=payload.assignee,
-            created_by="dashboard",
-            workspace_kind=payload.workspace_kind,
-            workspace_path=payload.workspace_path,
-            tenant=payload.tenant,
-            priority=payload.priority,
-            parents=payload.parents,
-            triage=payload.triage,
-            idempotency_key=payload.idempotency_key,
-            max_runtime_seconds=payload.max_runtime_seconds,
-            skills=payload.skills,
-            goal_mode=payload.goal_mode,
-            goal_max_turns=payload.goal_max_turns,
-            model_override=payload.model_override,
-            provider_override=payload.provider_override,
-            reasoning_effort=payload.reasoning_effort,
-            project_id=payload.project_id,
-            board=board,
-        )
+        import hashlib
+        fingerprint = hashlib.sha256(payload.model_dump_json().encode()).hexdigest()
+        with kanban_db.write_txn(conn):
+            existing = conn.execute(
+                "SELECT id FROM tasks WHERE idempotency_key = ? AND status != 'archived' ORDER BY created_at DESC LIMIT 1",
+                (payload.idempotency_key,),
+            ).fetchone() if payload.idempotency_key else None
+            if existing:
+                recorded = conn.execute(
+                    "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'dashboard_creation' ORDER BY id LIMIT 1",
+                    (existing[0],),
+                ).fetchone()
+                if not recorded or json.loads(recorded[0]).get('fingerprint') != fingerprint:
+                    raise HTTPException(status_code=409, detail={'task_id': existing[0],
+                                        'message': 'Idempotency key belongs to a different draft. Edit the retained card'})
+                return {'task': _task_dict(kanban_db.get_task(conn, existing[0]))}
+            task_id = kanban_db.create_task(
+                conn,
+                review_required=payload.review_required,
+                title=payload.title,
+                task_scope=payload.task_scope,
+                execution_authority=None,
+                body=payload.body,
+                assignee=payload.assignee,
+                created_by="dashboard",
+                workspace_kind=payload.workspace_kind,
+                workspace_path=payload.workspace_path,
+                branch_name=payload.branch_name,
+                tenant=payload.tenant,
+                priority=payload.priority,
+                parents=payload.parents,
+                triage=payload.triage,
+                idempotency_key=payload.idempotency_key,
+                max_runtime_seconds=payload.max_runtime_seconds,
+                skills=payload.skills,
+                goal_mode=payload.goal_mode,
+                goal_max_turns=payload.goal_max_turns,
+                model_override=payload.model_override,
+                provider_override=payload.provider_override,
+                reasoning_effort=payload.reasoning_effort,
+                project_id=payload.project_id,
+                board=board,
+            )
+            kanban_db._append_event(conn, task_id, 'dashboard_creation', {'fingerprint': fingerprint})
+        if payload.repository or payload.approved_base:
+            from hermes_cli.kanban_admission import prepare
+            try:
+                task = kanban_db.get_task(conn, task_id)
+                path = payload.workspace_path or task.workspace_path
+                if not all((payload.repository, path, payload.approved_base, payload.branch_name)):
+                    raise ValueError('Repository preparation needs identity, path, exact base and branch')
+                prepare(conn, task_id, payload.repository, path, payload.approved_base, payload.branch_name)
+            except (ValueError, OSError, subprocess.SubprocessError) as exc:
+                raise HTTPException(status_code=400, detail={'task_id': task_id, 'message': str(exc),
+                                    'recovery': 'The draft is retained. Correct preparation on this same card'})
+        if payload.execution_authority:
+            from hermes_cli.kanban_admission import authorise
+            try:
+                authorise(conn, task_id, payload.execution_authority)
+            except (ValueError, PermissionError) as exc:
+                raise HTTPException(status_code=400, detail={'task_id': task_id, 'message': str(exc)})
         task = kanban_db.get_task(conn, task_id)
         body: dict[str, Any] = {"task": _task_dict(task) if task else None}
         # Surface a dispatcher-presence warning so the UI can show a
@@ -1040,32 +1172,10 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
 
         # --- title / body -------------------------------------------------
         if payload.title is not None or payload.body is not None:
-            with kanban_db.write_txn(conn):
-                sets, vals = [], []
-                if payload.title is not None:
-                    if not payload.title.strip():
-                        raise HTTPException(status_code=400, detail="title cannot be empty")
-                    sets.append("title = ?")
-                    vals.append(payload.title.strip())
-                if payload.body is not None:
-                    sets.append("body = ?")
-                    vals.append(payload.body)
-                vals.append(task_id)
-                conn.execute(
-                    f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", vals,
-                )
-                conn.execute(
-                    "INSERT INTO task_events (task_id, kind, payload, created_at) "
-                    "VALUES (?, 'edited', NULL, ?)",
-                    (task_id, int(time.time())),
-                )
-            # Mutation-boundary observer (RFC #58548), post-commit. Field
-            # names only — values never leave the DB via this payload.
-            kanban_db.notify_task_updated(
-                conn, task_id,
-                [f for f in ("title", "body") if getattr(payload, f) is not None],
-                board=board,
-            )
+            try:
+                kanban_db.revise_task_requirements(conn, task_id, title=payload.title, body=payload.body, board=board)
+            except (ValueError, RuntimeError) as exc:
+                raise HTTPException(status_code=409, detail=str(exc))
 
         updated = kanban_db.get_task(conn, task_id)
         return {"task": _task_dict(updated) if updated else None}
@@ -2363,6 +2473,7 @@ class CreateBoardBody(BaseModel):
     # board's default_workdir mirrors the project's primary repo and new tasks
     # inherit the project (deterministic worktree + branch).
     project_id: Optional[str] = None
+    repository: Optional[str] = None
     switch: bool = False
 
 
@@ -2514,24 +2625,28 @@ def _validate_workdir(raw: str) -> str:
     Raises :class:`HTTPException` (400) for relative or non-directory
     paths — mirroring the create-board contract.
     """
-    requested = Path(raw).expanduser()
-    if not requested.is_absolute():
-        raise HTTPException(
-            status_code=400,
-            detail="Project directory must be an absolute path.",
-        )
-    if not requested.is_dir():
-        raise HTTPException(
-            status_code=400,
-            detail="Project directory must be an existing directory.",
-        )
-    return str(requested.resolve())
+    from hermes_cli.kanban_onboarding import inspect_directory
+    try:
+        return inspect_directory(raw)['path']
+    except (ValueError, OSError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @router.post("/boards")
 def create_board_endpoint(payload: CreateBoardBody):
     """Create a new board. Idempotent — ``slug`` collision returns existing."""
     default_workdir = None
+    if payload.repository:
+        from hermes_cli.kanban_onboarding import repository_helper
+        try:
+            inspected = repository_helper('inspect', payload.repository)
+            if not inspected.get('ready'):
+                raise ValueError('Prepare the repository before creating its board')
+            default_workdir = inspected['path']
+            if payload.default_workdir and payload.default_workdir != default_workdir:
+                raise ValueError('Selected repository and project directory differ')
+        except (ValueError, OSError, subprocess.SubprocessError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
     if payload.default_workdir:
         default_workdir = _validate_workdir(payload.default_workdir)
     # A chosen project scopes the board: its primary repo becomes the default

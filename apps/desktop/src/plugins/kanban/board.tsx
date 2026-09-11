@@ -549,9 +549,6 @@ function NewTaskDialog({
   const k = useKanban()
   const qc = useQueryClient()
   const { data: roster } = useQuery({ queryKey: PROFILES_KEY, queryFn: fetchProfiles, staleTime: 60_000 })
-  // Title-only creates must RUN: "auto" resolves to the orchestration default
-  // (ultimately the active profile), applied at create time. Never silently
-  // unassigned — parking a card is the explicit choice, not the default.
   const resolvedDefault = useOrchestration()?.resolved_default_assignee || 'default'
 
   // Board-level workspace default: a task inherits the current board's
@@ -567,6 +564,10 @@ function NewTaskDialog({
   const isTriage = target === 'triage'
   const [title, setTitle] = useState('')
   const [bodyText, setBodyText] = useState('')
+  const [repository, setRepository] = useState('')
+  const [baseRevision, setBaseRevision] = useState('')
+  const [branch, setBranch] = useState('')
+  const [idempotencyKey, setIdempotencyKey] = useState<string>(() => crypto.randomUUID())
   const [assignee, setAssignee] = useState('')
   const [priority, setPriority] = useState('0')
   const [skills, setSkills] = useState('')
@@ -602,6 +603,10 @@ function NewTaskDialog({
     if (target) {
       setTitle('')
       setBodyText('')
+      setRepository('')
+      setBaseRevision('')
+      setBranch('')
+      setIdempotencyKey(crypto.randomUUID())
       setAssignee('')
       setPriority('0')
       setSkills('')
@@ -632,11 +637,14 @@ function NewTaskDialog({
         .map(s => s.trim())
         .filter(Boolean)
 
-      // create() derives status (triage flag → 'triage', else 'ready'); move to
-      // the requested column when they differ, so a per-column add lands right.
-      const { task, warning } = await createTask({
+      const { warning } = await createTask({
         assignee: assignee === PARKED ? undefined : assignee || resolvedDefault,
-        body: bodyText.trim() || undefined,
+        body: bodyText,
+        idempotency_key: idempotencyKey,
+        repository: workspaceKind === 'worktree' ? repository || undefined : undefined,
+        approved_base: workspaceKind === 'worktree' ? baseRevision || undefined : undefined,
+        branch_name: workspaceKind === 'worktree' ? branch || undefined : undefined,
+        review_required: workspaceKind === 'worktree',
         goal_mode: goalMode,
         parents: parent ? [parent] : undefined,
         priority: Number(priority) || 0,
@@ -649,9 +657,6 @@ function NewTaskDialog({
         workspace_path: workspaceKind !== 'scratch' && workspacePath.trim() ? workspacePath.trim() : undefined
       })
 
-      if (task && task.status !== target) {
-        await patchTask(task.id, { status: target })
-      }
 
       // Dispatcher-presence warning ("this ready task will sit idle") — not an
       // error, but the user should know.
@@ -679,7 +684,7 @@ function NewTaskDialog({
           becomes a no-op and can go. */}
       <DialogContent className="w-[min(42rem,94vw)] max-w-none overflow-visible">
         <DialogHeader>
-          <DialogTitle>{target ? k.newTaskIn(columnLabel(k, target)) : k.newTask}</DialogTitle>
+          <DialogTitle>{k.prepareDraft}</DialogTitle>
         </DialogHeader>
         <div className="flex max-h-[min(72vh,44rem)] flex-col gap-3 overflow-y-auto pr-0.5">
           <Input
@@ -735,6 +740,16 @@ function NewTaskDialog({
             </Field>
           )}
 
+          <p className="text-xs text-(--ui-text-tertiary)">{k.draftHelp}</p>
+          <Field label={k.idempotencyKey}>
+            <Input onChange={event => setIdempotencyKey(event.target.value)} value={idempotencyKey} />
+          </Field>
+          {workspaceKind === 'worktree' && <>
+            <Field label={k.repositoryIdentity}><Input onChange={event => setRepository(event.target.value)} value={repository} /></Field>
+            <Field label={k.approvedBase}><Input onChange={event => setBaseRevision(event.target.value)} value={baseRevision} /></Field>
+            <Field label={k.taskBranch}><Input onChange={event => setBranch(event.target.value)} value={branch} /></Field>
+            <p className="text-xs">{k.requiredRepositoryReview}</p>
+          </>}
           <Field label={k.assignee}>
             <Select onValueChange={v => setAssignee(v === NO_PARENT ? '' : v)} value={assignee || NO_PARENT}>
               <SelectTrigger>

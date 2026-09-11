@@ -218,6 +218,12 @@ function nudged<T>(write: Promise<T>): Promise<T> {
 export const patchTask = (id: string, patch: Record<string, unknown>) =>
   nudged(call(withBoard(`/tasks/${id}`), { method: 'PATCH', body: patch }))
 
+export const prepareTask = (id: string, body: Record<string, unknown>, set = false) =>
+  call(withBoard(`/tasks/${id}/${set ? 'prepare-set' : 'prepare'}`), { method: 'POST', body })
+
+export const authoriseTask = (id: string, authority: string) =>
+  nudged(call(withBoard(`/tasks/${id}/authorise`), { method: 'POST', body: { authority } }))
+
 export const createTask = (body: Record<string, unknown>) =>
   nudged(call<{ task: KanbanTask | null; warning?: string }>(withBoard('/tasks'), { method: 'POST', body }))
 
@@ -246,10 +252,28 @@ export const reclaimTask = (id: string) => nudged(call(withBoard(`/tasks/${id}/r
 export const uploadAttachment = (id: string, upload: { filename: string; contentType?: string; bytes: ArrayBuffer }) =>
   call(withBoard(`/tasks/${id}/attachments`), { method: 'POST', upload })
 
-export const createBoard = (slug: string, name: string, projectId?: string) =>
+export interface RepositoryInspection {
+  server: string
+  path: null | string
+  repository?: string
+  kind: string
+  exists?: boolean
+  ready?: boolean
+  writable?: boolean
+}
+
+export const inspectRepository = (repository: string, path: string) =>
+  call<RepositoryInspection>('/repositories/inspect', { method: 'POST', body: { repository: repository || undefined, path: path || undefined } })
+
+export const prepareRepository = (repository: string, authority: string) =>
+  call<RepositoryInspection>('/repositories/prepare', { method: 'POST', body: { repository, clone_authority: authority } })
+
+export const fetchRepositories = () => call<{ repositories: Array<RepositoryInspection> }>('/repositories')
+
+export const createBoard = (slug: string, name: string, projectId?: string, workspace?: { repository?: string; default_workdir?: string }) =>
   call<{ board: { slug: string } }>('/boards', {
     method: 'POST',
-    body: { slug, name, ...(projectId ? { project_id: projectId } : {}) }
+    body: { slug, name, ...(projectId ? { project_id: projectId } : {}), ...workspace }
   })
 
 /** Rough auxiliary-model estimate for a task (tokens + complexity). Makes a

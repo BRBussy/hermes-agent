@@ -327,16 +327,8 @@ VALID_HOOKS: Set[str] = {
     # extensions and deferred reclaims do NOT fire. Adds:
     #   worker_pid: int | None, heartbeat_stale: bool, retry_status: str.
     "on_kanban_worker_stale_claim",
-    # on_kanban_task_updated is the task-mutation boundary observer: it
-    # fires after a committed task-row field write outside the
-    # claim/complete/block lifecycle — kanban_db.assign_task,
-    # set_model_override, and set_reasoning_effort, plus the dashboard
-    # plugin API's direct-SQL priority/title/body editors (single and
-    # bulk) via kanban_db.notify_task_updated. Adds:
-    #   changed_fields: list[str] — field NAMES only; new values are never
-    #   carried (fetch the task if you need them).
-    #   Privacy: names only here, but title/body values in the board DB may
-    #   contain user/project content.
+    # Reports committed task-row field writes outside claim/complete/block.
+    # changed_fields contains field names. Read the task to obtain values.
     "on_kanban_task_updated",
     # on_kanban_dispatch_tick fires once per dispatcher tick in
     # dispatch_once, strictly AFTER the board's single-writer dispatch lock

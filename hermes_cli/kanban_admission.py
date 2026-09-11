@@ -18,6 +18,11 @@ def _operator():
 
 
 def validate_repository(task):
+    if getattr(task, 'workspace_set', None):
+        from hermes_cli.kanban_workspace_set import members
+        for member in members(task):
+            validate_repository(member)
+        return
     from hermes_cli import kanban_db as kb
     if not all((task.repository_identity, task.approved_base, task.workspace_path,
                 task.branch_name, task.review_required, task.workspace_kind == 'worktree')):
@@ -38,11 +43,15 @@ def validate_repository(task):
 
 
 def rejection(task):
+    if getattr(task, 'workspace_set', None) and task.workspace_set.get('state') != 'prepared':
+        return 'Workspace preparation is incomplete'
     if not task.execution_authority:
         return 'Explicit execution authority is required'
     if task.task_scope == 'repository' or task.workspace_kind == 'worktree' or task.project_id:
         try:
             validate_repository(task)
+            if not task.body or not task.body.strip():
+                return 'Repository execution requires a complete task description'
         except (ValueError, OSError, subprocess.SubprocessError) as exc:
             return str(exc)
     from hermes_cli.kanban_publication import dispatch_rejection
@@ -75,11 +84,17 @@ def authorise(conn, task_id, authority, *, publication_actions=None):
             raise ValueError('Reconcile the failed attempt before authorising recovery')
         if task.task_scope == 'repository' or task.workspace_kind == 'worktree' or task.project_id:
             validate_repository(task)
+            if not task.body or not task.body.strip():
+                raise ValueError('Repository execution requires a complete task description')
             from hermes_cli.kanban_worktree import retain
             retain(task)
         if publication_actions is not None:
-            from hermes_cli.kanban_publication import authorise as authorise_publication
-            authorise_publication(conn, task, authority.strip(), publication_actions)
+            from hermes_cli.kanban_publication import authorise as authorise_repository_publication
+            if getattr(task, 'workspace_set', None):
+                from hermes_cli.kanban_workspace_set import authorise_publication as authorise_set_publication
+                authorise_set_publication(conn, task, authority.strip(), publication_actions)
+            else:
+                authorise_repository_publication(conn, task, authority.strip(), publication_actions)
         elif task.publication and task.publication['phase'] not in {'verified', 'reviewing_publication'}:
             from hermes_cli.kanban_publication import save
             save(conn, task_id, dict(task.publication, phase='changes_required', authority=None, actions=[]))
@@ -114,6 +129,8 @@ def prepare(conn, task_id, repository, repository_path, base, branch):
                     identity, base.lower(), branch, str(target)):
                 raise ValueError('Preparation conflicts with the recorded repository, base, branch or workspace')
             validate_repository(task)
+            if not task.body or not task.body.strip():
+                raise ValueError('Repository execution requires a complete task description')
             from hermes_cli.kanban_worktree import retain
             retain(task)
             return task

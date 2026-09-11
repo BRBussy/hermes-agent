@@ -57,7 +57,8 @@ def fixture(tmp_path, monkeypatch, request):
         path = root / 'board.db'
         monkeypatch.setenv('HERMES_KANBAN_DB', str(path))
         conn = kb.connect(path)
-        tid = kb.create_task(conn, title='Retain reviewed work', assignee='builder', task_scope='repository')
+        tid = kb.create_task(conn, title='Retain reviewed work', assignee='builder', task_scope='repository',
+                             body='Preserve repository deliverables through independently reviewed task lifecycle transitions.')
         task = admission.prepare(conn, tid, 'BRBussy/hermes-agent', str(repo), git(repo, 'rev-parse', 'HEAD'), f'test/{tid}')
         worktree = Path(task.workspace_path)
         (worktree / '.task-evidence').mkdir()

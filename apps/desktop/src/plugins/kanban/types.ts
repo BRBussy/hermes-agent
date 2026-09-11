@@ -13,7 +13,11 @@ export interface KanbanTask {
   tenant?: null | string
   created_at?: number
   latest_summary?: null | string
-  publication?: null | { phase: string, label: string }
+  publication?: null | {
+    phase: string
+    label: string
+    repositories?: Record<string, { authority?: string; actions: string[] }>
+  }
   comment_count?: number
   link_counts?: { parents: number; children: number }
   /** N-of-M child completion, or null when the task has no children. */
@@ -108,6 +112,18 @@ export interface KanbanTaskFull extends KanbanTask {
   workspace_kind?: null | string
   workspace_path?: null | string
   branch_name?: null | string
+  repository_identity?: null | string
+  approved_base?: null | string
+  execution_authority?: null | string
+  review_required?: boolean
+  idempotency_key?: null | string
+  workspace_set?: null | {
+    state: string
+    repositories: Array<{ repository: string; path: string; base: string; branch: string; workspace_path: string }>
+    links: Array<{ consumer: string; dependency: string; package: string }>
+    package_manager: null | string
+    test_commands: string[]
+  }
   consecutive_failures?: number
   diagnostics?: Diagnostic[]
 }

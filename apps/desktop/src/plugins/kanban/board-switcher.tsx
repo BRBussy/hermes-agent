@@ -32,7 +32,7 @@ import {
   useQueryClient,
   useValue
 } from '@hermes/plugin-sdk'
-import { type ReactNode, useEffect, useState } from 'react'
+import { type ReactNode, useEffect, useRef, useState } from 'react'
 
 import {
   $boardSlug,
@@ -41,8 +41,12 @@ import {
   deleteBoard,
   fetchBoards,
   fetchProjects,
+  fetchRepositories,
+  inspectRepository,
   pluginOs,
+  prepareRepository,
   PROJECTS_KEY,
+  type RepositoryInspection,
   updateBoard
 } from './api'
 import { runExportBoardFlow, runImportBoardFlow } from './transfer'
@@ -173,6 +177,40 @@ function NewBoardDialog({ onClose, open }: { onClose: () => void; open: boolean 
   const k = useKanban()
   const [name, setName] = useState('')
   const [project, setProject] = useState('')
+  const [repository, setRepository] = useState('')
+  const [directory, setDirectory] = useState('')
+  const [authority, setAuthority] = useState('')
+  const [inspection, setInspection] = useState<RepositoryInspection | null>(null)
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
+  const generation = useRef(0)
+  const { data: projects } = useQuery({ queryKey: PROJECTS_KEY, queryFn: fetchProjects, enabled: open })
+  const { data: inventory } = useQuery({ queryKey: ['kanban', 'repositories'], queryFn: fetchRepositories, enabled: open })
+
+  const inspect = async (prepare: boolean, selectedPath?: string) => {
+    const request = ++generation.current
+    setBusy(true)
+    setError('')
+
+    try {
+      const result = await (prepare ? prepareRepository(repository.trim(), authority.trim()) : inspectRepository(selectedPath === undefined ? repository.trim() : '', selectedPath ?? directory.trim()))
+
+      if (request !== generation.current) {return}
+      setInspection(result)
+
+      if (result.ready && result.path) {setDirectory(result.path)}
+    } catch (cause) {
+      if (request === generation.current) {setError(errText(cause))}
+    } finally {
+      if (request === generation.current) {setBusy(false)}
+    }
+  }
+
+  const invalidate = () => {
+    generation.current += 1
+    setInspection(null)
+    setBusy(false)
+  }
 
   const slug = name
     .trim()
@@ -180,15 +218,8 @@ function NewBoardDialog({ onClose, open }: { onClose: () => void; open: boolean 
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '')
 
-  useEffect(() => {
-    if (open) {
-      setName('')
-      setProject('')
-    }
-  }, [open])
-
   const create = useBoardWrite(
-    () => createBoard(slug, name.trim(), project || undefined),
+    () => createBoard(slug, name.trim(), project || undefined, { repository: repository.trim() || undefined, default_workdir: directory.trim() || undefined }),
     result => {
       $boardSlug.set(result.board.slug)
       onClose()
@@ -198,16 +229,34 @@ function NewBoardDialog({ onClose, open }: { onClose: () => void; open: boolean 
   return (
     <BoardDialog
       confirmLabel={k.createBoard}
-      disabled={!slug || create.isPending}
+      disabled={!slug || create.isPending || busy || (!inspection || (Boolean(repository.trim()) && !inspection.ready))}
       onClose={onClose}
       onConfirm={() => create.mutate()}
       open={open}
       title={k.newBoard}
     >
-      {/* Enter submits only while the scope is untouched — once a project is
-          picked the choice is worth a deliberate click. */}
-      <BoardNameField onChange={setName} onEnter={() => slug && !project && create.mutate()} slug={slug} value={name} />
-      <ProjectPicker onChange={setProject} value={project} />
+      <BoardNameField onChange={setName} onEnter={() => {}} slug={slug} value={name} />
+      <ProjectPicker onChange={value => { setProject(value); setRepository(''); setDirectory(''); invalidate(); void inspect(false, projects?.projects.find(entry => entry.id === value)?.primary_path ?? '') }} value={project} />
+      <>
+        <p className="text-xs text-(--ui-text-tertiary)">{k.boardWorkspaceHelp}</p>
+        {!project && <label className="flex flex-col gap-1 text-xs">{k.repositoryIdentity}
+          <Input list="kanban-board-repositories" onChange={event => { setRepository(event.target.value); invalidate() }} value={repository} />
+          <datalist id="kanban-board-repositories">{inventory?.repositories.map(row => <option key={row.repository} value={row.repository} />)}</datalist>
+        </label>}
+        <label className="flex flex-col gap-1 text-xs">{k.primaryCheckout}
+          <Input disabled={Boolean(project)} onChange={event => { setDirectory(event.target.value); setRepository(''); invalidate() }} value={directory} />
+        </label>
+        <Button disabled={busy} onClick={() => void inspect(false)} variant="text">{k.inspectWorkspace}</Button>
+        {inspection && <p className="break-all text-xs">{k.serverIdentity}: {inspection.server}<br />
+          {k.primaryCheckout}: {inspection.path || k.empty}<br />{k.workspace}: {inspection.kind}<br />
+          {k.repositoryIdentity}: {inspection.repository || k.empty}<br />{k.accessChecks}: {inspection.kind === 'scratch' ? k.temporaryOutput : inspection.ready || inspection.writable ? k.accessReady : k.preparationRequired}
+        </p>}
+        {inspection?.exists === false && <>
+          <label className="flex flex-col gap-1 text-xs">{k.cloneAuthority}<Input onChange={event => setAuthority(event.target.value)} value={authority} /></label>
+          <Button disabled={busy || !authority.trim()} onClick={() => void inspect(true)}>{k.prepareCheckout}</Button>
+        </>}
+        {error && <p className="text-xs" role="alert">{error}</p>}
+      </>
     </BoardDialog>
   )
 }
@@ -399,7 +448,7 @@ export function BoardSwitcher() {
           )}
         </DropdownMenuContent>
       </DropdownMenu>
-      <NewBoardDialog onClose={() => setAdding(false)} open={adding} />
+      {adding && <NewBoardDialog onClose={() => setAdding(false)} open />}
       <RenameBoardDialog board={renameFor} onClose={() => setRenameFor(null)} />
       <BoardSettingsDialog board={settingsFor} onClose={() => setSettingsFor(null)} />
       <ConfirmDialog

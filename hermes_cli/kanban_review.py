@@ -16,6 +16,17 @@ def capture_state(task):
     This is a completion-time snapshot, not a filesystem lock against other
     processes changing files after completion.
     """
+    if getattr(task, 'workspace_set', None):
+        from hermes_cli.kanban_workspace_set import members
+        repositories = members(task)
+        states = {member.repository_identity: capture_state(member) for member in repositories}
+        if states != {member.repository_identity: capture_state(member) for member in repositories}:
+            raise ValueError('Workspace set changed during review capture')
+        state = dict(next(iter(states.values())))
+        state['repositories'] = states
+        state['workspace_set'] = task.workspace_set
+        state['id'] = hashlib.sha256(json.dumps(state, sort_keys=True, ensure_ascii=True).encode()).hexdigest()
+        return state
     if task.repository_identity:
         from hermes_cli.kanban_admission import validate_repository
         validate_repository(task)
@@ -112,6 +123,15 @@ def completion_rejection(conn, task, metadata, expected_run_id, *, outcome="appr
         current = capture_state(task)
     except (ValueError, OSError, subprocess.SubprocessError) as exc:
         return f"Cannot verify reviewed state: {exc}"
+    if getattr(task, 'workspace_set', None):
+        checks = metadata.get('repository_checks')
+        required = current['repositories']
+        if not isinstance(checks, dict) or set(checks) != set(required):
+            return 'Independent review requires checks for every repository in the workspace set'
+        for identity, state in required.items():
+            receipt = checks[identity]
+            if not isinstance(receipt, dict) or receipt.get('reviewed_state_id') != state['id'] or not receipt.get('checks'):
+                return 'Each repository requires its exact reviewed state and independent checks'
     if current != submission["state"]:
         return "Deliverables or requirements changed. Request changes and resubmit for fresh review"
     return None
